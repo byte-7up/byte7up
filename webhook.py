@@ -3,6 +3,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib import error, request
+from urllib.parse import urlsplit
 
 STATUSES_TO_BACKUP = {"EXPIRED", "DISABLED", "LIMITED"}
 
@@ -13,6 +14,15 @@ BACKUP_SQUAD_UUID = os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_FILE = os.path.join(BASE_DIR, "data", "original_squads.json")
 DATA_FILE = os.getenv("DATA_PATH", DEFAULT_DATA_FILE)
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/api/v1/remnawave")
+
+
+def normalize_path(path):
+    if not path:
+        return "/"
+
+    normalized = path if path == "/" else path.rstrip("/")
+    return normalized or "/"
 
 
 def load_original_squads():
@@ -92,6 +102,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded_body)
 
     def do_POST(self):
+        request_path = normalize_path(urlsplit(self.path).path)
+        expected_path = normalize_path(WEBHOOK_PATH)
+
+        if request_path != expected_path:
+            print(f"Ignoring POST to unexpected path: {request_path}")
+            self._send_text(404, "Not Found")
+            return
+
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
 
@@ -149,7 +167,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 def run():
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
-    print(f"Webhook server running on port {PORT}")
+    print(f"Webhook server running on port {PORT}, path {normalize_path(WEBHOOK_PATH)}")
     server.serve_forever()
 
 
