@@ -1,79 +1,157 @@
 #!/usr/bin/env python3
-import os
 import json
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib import request
+from urllib import error, request
 
-PORT = int(os.getenv("PORT", 3000))
-API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api")
+STATUSES_TO_BACKUP = {"EXPIRED", "DISABLED", "LIMITED"}
+
+PORT = int(os.getenv("PORT", "3000"))
+API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api").rstrip("/")
 API_TOKEN = os.getenv("RW_API_TOKEN", "YOUR_API_TOKEN")
 BACKUP_SQUAD_UUID = os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid")
-DATA_FILE = os.getenv("DATA_PATH", "/data/original_squads.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATA_FILE = os.path.join(BASE_DIR, "data", "original_squads.json")
+DATA_FILE = os.getenv("DATA_PATH", DEFAULT_DATA_FILE)
 
-# Загружаем оригинальные squad'ы
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        original_squads = json.load(f)
-else:
-    original_squads = {}
+
+def load_original_squads():
+    if not os.path.exists(DATA_FILE):
+        return {}
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as file_obj:
+            data = json.load(file_obj)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Failed to load state file {DATA_FILE}: {exc}")
+        return {}
+
+    if not isinstance(data, dict):
+        print(f"State file {DATA_FILE} must contain a JSON object")
+        return {}
+
+    return data
+
+
+original_squads = load_original_squads()
+
 
 def save_original_squads():
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    with open(DATA_FILE, "w") as f:
-        json.dump(original_squads, f, indent=2)
+    directory = os.path.dirname(DATA_FILE)
+
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        with open(DATA_FILE, "w", encoding="utf-8") as file_obj:
+            json.dump(original_squads, file_obj, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        print(f"Failed to save state file {DATA_FILE}: {exc}")
+        return False
+
+    return True
+
 
 def patch_user_squad(user_uuid, squads):
     url = f"{API_URL}/users/{user_uuid}"
     data = json.dumps({"squadUuids": squads}).encode("utf-8")
-    req = request.Request(url, data=data, method="PATCH",
-                          headers={
-                              "Authorization": f"Bearer {API_TOKEN}",
-                              "Content-Type": "application/json"
-                          })
+    req = request.Request(
+        url,
+        data=data,
+        method="PATCH",
+        headers={
+            "Authorization": f"Bearer {API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+
     try:
         with request.urlopen(req) as resp:
-            body = resp.read().decode()
-            print(f"PATCH {user_uuid} -> {squads}, status={resp.status}")
-    except Exception as e:
-        print(f"Error patching user {user_uuid}: {e}")
+            body = resp.read().decode("utf-8", "replace")
+            print(f"PATCH {user_uuid} -> {squads}, status={resp.status}, body={body}")
+            return True
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        print(
+            f"HTTP error patching user {user_uuid}: "
+            f"status={exc.code}, body={body}"
+        )
+    except Exception as exc:
+        print(f"Error patching user {user_uuid}: {exc}")
+
+    return False
+
 
 class WebhookHandler(BaseHTTPRequestHandler):
+    def _send_text(self, status_code, body):
+        encoded_body = body.encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded_body)))
+        self.end_headers()
+        self.wfile.write(encoded_body)
+
     def do_POST(self):
-        content_length = int(self.headers.get('Content-Length', 0))
+        content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
+
         try:
             payload = json.loads(body)
             user = payload["data"]
             event = payload.get("event", "")
-            print(f"Webhook received: {event} for {user['username']}, status={user['status']}")
+            user_uuid = user["uuid"]
+            username = user.get("username", user_uuid)
+            status = user["status"]
+            squad_uuids = user["squadUuids"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            print(f"Webhook parse error: {exc}")
+            self._send_text(400, "Invalid payload")
+            return
 
-            # EXPIRED / DISABLED / LIMITED → backup
-            if user["status"] in ["EXPIRED", "DISABLED", "LIMITED"]:
-                if user["uuid"] not in original_squads:
-                    original_squads[user["uuid"]] = user["squadUuids"]
-                    save_original_squads()
-                    print(f"Saved original squads for {user['username']}: {user['squadUuids']}")
+        print(f"Webhook received: {event} for {username}, status={status}")
 
-                patch_user_squad(user["uuid"], [BACKUP_SQUAD_UUID])
+        if status in STATUSES_TO_BACKUP:
+            if user_uuid not in original_squads:
+                original_squads[user_uuid] = list(squad_uuids)
+                if not save_original_squads():
+                    original_squads.pop(user_uuid, None)
+                    self._send_text(500, "Failed to save original squads")
+                    return
 
-            # ACTIVE → restore original squad
-            elif user["status"] == "ACTIVE":
-                squads_to_restore = original_squads.get(user["uuid"], user["squadUuids"])
-                patch_user_squad(user["uuid"], squads_to_restore)
-                original_squads.pop(user["uuid"], None)
-                save_original_squads()
+                print(f"Saved original squads for {username}: {squad_uuids}")
 
-        except Exception as e:
-            print(f"Webhook parse error: {e}")
+            if not patch_user_squad(user_uuid, [BACKUP_SQUAD_UUID]):
+                self._send_text(502, "Failed to patch user")
+                return
 
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        elif status == "ACTIVE":
+            squads_to_restore = original_squads.get(user_uuid)
+            if squads_to_restore is None:
+                print(f"No saved squads for {username}, nothing to restore")
+            else:
+                if not patch_user_squad(user_uuid, squads_to_restore):
+                    self._send_text(502, "Failed to restore user squads")
+                    return
+
+                original_squads.pop(user_uuid, None)
+                if not save_original_squads():
+                    original_squads[user_uuid] = squads_to_restore
+                    self._send_text(500, "Failed to update local state")
+                    return
+
+                print(f"Restored original squads for {username}: {squads_to_restore}")
+
+        else:
+            print(f"Ignoring status {status} for {username}")
+
+        self._send_text(200, "OK")
+
 
 def run():
-    server = HTTPServer(('', PORT), WebhookHandler)
+    server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     print(f"Webhook server running on port {PORT}")
     server.serve_forever()
+
 
 if __name__ == "__main__":
     run()
