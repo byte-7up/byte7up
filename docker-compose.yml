@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  remna-webhook:
+    build: .
+    container_name: remna-webhook
+    restart: unless-stopped
+    environment:
+      - RW_API_URL=${RW_API_URL}
+      - RW_API_TOKEN=${RW_API_TOKEN}
+      - BACKUP_SQUAD_UUID=${BACKUP_SQUAD_UUID}
+      - PORT=${PORT}
+      - DATA_PATH=/data/original_squads.json
+    volumes:
+      - webhook_data:/data
+    ports:
+      - "3000:3000"
+
+volumes:
+  webhook_data:
