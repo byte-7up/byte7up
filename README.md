@@ -1,102 +1,69 @@
 # Remnawave Webhook Handler
 
-Лёгкий Python-сервис для обработки webhook от **Remnawave**, позволяющий:
+Лёгкий Python‑сервис для обработки webhook от **Remnawave** —  
+он автоматически:
 
-- Переключать пользователя на резервный squad при статусах **EXPIRED**, **DISABLED**, **LIMITED**  
-- Восстанавливать оригинальный squad при статусе **ACTIVE**  
-- Сохранять оригинальные squad’ы пользователей между перезапусками через Docker volume  
-- Полностью работать через Docker без сторонних зависимостей  
-
----
-
-## 🚀 Особенности
-
-- Чистый Python 3 — без сторонних библиотек (`requests`, `flask`, и т.д.)  
-- Хранение данных пользователей в JSON (`/data/original_squads.json`)  
-- Легко проксируется через **nginx**, **traefik** или любой другой reverse proxy  
-- Готов для запуска на сервере или локально через Docker Compose  
+- Переключает пользователя на резервный squad при статусах **EXPIRED**, **DISABLED**, **LIMITED**  
+- Восстанавливает оригинальный squad при статусе **ACTIVE**  
+- Сохраняет оригинальные squad’ы пользователей между перезапусками через Docker volume  
+- Работает полностью в Docker без сторонних зависимостей
 
 ---
 
-## 📁 Структура проекта
+## 🔧 Установка
 
-
-remnawave-webhook/
-├── webhook.py # основной Python скрипт webhook
-├── Dockerfile # контейнер для запуска
-├── docker-compose.yml # поднимает сервис с volume
-├── .env.example # пример переменных окружения
-└── README.md # инструкции по использованию
-
-
----
-
-## ⚙️ Настройка
-
-1. Клонируем репозиторий:
-
+1. **Устанавливаем Docker**
 ```bash
-git clone https://github.com/YOUR_USERNAME/remnawave-webhook.git
-cd remnawave-webhook
+sudo curl -fsSL https://get.docker.com | sh
 
-Создаём .env на основе примера:
+Создаём рабочую папку
 
-cp .env.example .env
-nano .env  # заполни свои значения
-Пример .env
-# Панель Remnawave API
+sudo mkdir -p /opt/remnawave-webhook && cd /opt/remnawave-webhook
+
+Скачиваем файлы из репозитория
+
+sudo wget -O .env https://raw.githubusercontent.com/byte-7up/byte7up/main/.env.example
+sudo wget -O docker-compose.yml https://raw.githubusercontent.com/byte-7up/byte7up/main/docker-compose.yml
+sudo wget -O webhook.py https://raw.githubusercontent.com/byte-7up/byte7up/main/webhook.py
+sudo wget -O Dockerfile https://raw.githubusercontent.com/byte-7up/byte7up/main/Dockerfile
+
+Заполняем переменные
+
+sudo nano .env
+
+Заполните:
+
 RW_API_URL=https://panel.example.com/api
 RW_API_TOKEN=ВАШ_API_TOKEN
-
-# UUID резервного squad
-BACKUP_SQUAD_UUID=backup-squad-uuid
-
-# Порт webhook
+BACKUP_SQUAD_UUID=uuid_резервного_squad
 PORT=3000
-
-# Путь для хранения оригинальных squad
 DATA_PATH=/data/original_squads.json
-🐳 Запуск через Docker Compose
+🐳 Запуск
 docker compose up -d
 
-Контейнер поднимет Python webhook сервер
+Контейнер запустит Python‑вебхук сервер, который будет обрабатывать события от Remnawave.
 
-JSON с оригинальными squad’ами будет сохраняться в volume webhook_data
+🔗 Настройка webhook в панели Remnawave
 
-🔗 Настройка Webhook в Remnawave
+В панели Remnawave:
 
-В панели Remnawave настройте Webhook URL:
+Webhook URL:
+https://your-domain/webhook
 
-https://your-domain-or-ip:443/webhook
+Если стоит reverse proxy (nginx/traefik), проксируйте путь /webhook на сервис с портом 3000.
 
-Если используете reverse proxy (nginx/traefik), проксируйте этот путь на порт контейнера (по умолчанию 3000)
+📌 Что делает сервис
+Когда пользователь получает статус:
+Статус	Действие
+EXPIRED / DISABLED / LIMITED	Сохраняется оригинальный squad и переключается на резервный
+ACTIVE	Оригинальный squad восстанавливается
 
-Webhook автоматически отправляет данные пользователя в контейнер, который переключает squad
+Оригинальные squad’ы хранятся в /data/original_squads.json в Docker volume.
 
-📝 Логика работы
+⚠️ Важные замечания
 
-При событии пользователя со статусом EXPIRED, DISABLED или LIMITED:
+Не забудьте смонтировать volume /data, чтобы данные о squad’ах сохранялись между перезапусками.
 
-Сохраняется оригинальный squad пользователя
+Скрипт автономный — Python и зависимости встроены в контейнер.
 
-Пользователь переключается на резервный squad (BACKUP_SQUAD_UUID)
-
-При событии ACTIVE:
-
-Пользователь возвращается в оригинальный squad
-
-Запись в JSON удаляется
-
-⚠️ Примечания
-
-Не забудьте смонтировать volume /data в Docker, чтобы данные о squad’ах сохранялись между перезапусками.
-
-Скрипт полностью автономен, никаких npm / Python зависимостей не требуется.
-
-Рекомендуется использовать HTTPS и reverse proxy для безопасного подключения вебхука.
-
-🛠 Поддержка и развитие
-
-Этот проект можно расширять: добавлять динамический выбор резервных серверов по стране, логирование в Telegram/Discord, использование Redis/PostgreSQL вместо JSON.
-
-Для предложений и улучшений можно создавать Pull Requests в репозитории.
+Рекомендуется использовать HTTPS и reverse proxy для безопасности.
