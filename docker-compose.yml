@@ -14,6 +14,12 @@ services:
       - webhook_data:/data
     ports:
       - "${BIND_HOST:-127.0.0.1}:${HOST_PORT:-3002}:${PORT:-3000}"
+    networks:
+      - remnawave-network
 
 volumes:
   webhook_data:
+
+networks:
+  remnawave-network:
+    external: true
