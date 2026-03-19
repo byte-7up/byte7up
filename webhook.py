@@ -44,6 +44,25 @@ def preview_json(data):
         return repr(data)
 
 
+def build_patch_urls(user_uuid):
+    base_urls = [API_URL]
+
+    if not API_URL.endswith("/api"):
+        base_urls.append(f"{API_URL}/api")
+
+    urls = []
+    for base_url in base_urls:
+        urls.append(f"{base_url}/users")
+        urls.append(f"{base_url}/users/{user_uuid}")
+
+    unique_urls = []
+    for url in urls:
+        if url not in unique_urls:
+            unique_urls.append(url)
+
+    return unique_urls
+
+
 def ensure_list(value):
     if value is None:
         return []
@@ -142,7 +161,6 @@ def save_original_squads():
 
 
 def patch_user_squad(user_uuid, squads):
-    url = f"{API_URL}/users"
     payload_variants = (
         {"uuid": user_uuid, "activeInternalSquads": squads},
         {"uuid": user_uuid, "active_internal_squads": squads},
@@ -152,34 +170,35 @@ def patch_user_squad(user_uuid, squads):
         {"uuid": user_uuid, "squad_uuids": squads},
     )
 
-    for payload in payload_variants:
-        data = json.dumps(payload).encode("utf-8")
-        req = request.Request(
-            url,
-            data=data,
-            method="PATCH",
-            headers={
-                "Authorization": f"Bearer {API_TOKEN}",
-                "Content-Type": "application/json",
-            },
-        )
-
-        try:
-            with request.urlopen(req) as resp:
-                body = resp.read().decode("utf-8", "replace")
-                log(
-                    f"PATCH {user_uuid} -> {preview_json(payload)}, "
-                    f"status={resp.status}, body={body}"
-                )
-                return True
-        except error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            log(
-                f"HTTP error patching user {user_uuid} with {preview_json(payload)}: "
-                f"status={exc.code}, body={body}"
+    for url in build_patch_urls(user_uuid):
+        for payload in payload_variants:
+            data = json.dumps(payload).encode("utf-8")
+            req = request.Request(
+                url,
+                data=data,
+                method="PATCH",
+                headers={
+                    "Authorization": f"Bearer {API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
             )
-        except Exception as exc:
-            log(f"Error patching user {user_uuid} with {preview_json(payload)}: {exc}")
+
+            try:
+                with request.urlopen(req) as resp:
+                    body = resp.read().decode("utf-8", "replace")
+                    log(
+                        f"PATCH {url} with {preview_json(payload)}, "
+                        f"status={resp.status}, body={body}"
+                    )
+                    return True
+            except error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "replace")
+                log(
+                    f"HTTP error patching via {url} with {preview_json(payload)}: "
+                    f"status={exc.code}, body={body}"
+                )
+            except Exception as exc:
+                log(f"Error patching via {url} with {preview_json(payload)}: {exc}")
 
     return False
 
@@ -287,7 +306,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 def run():
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
-    log(f"Webhook server running on port {PORT}, path {normalize_path(WEBHOOK_PATH)}")
+    log(
+        f"Webhook server running on port {PORT}, path {normalize_path(WEBHOOK_PATH)}, "
+        f"api_url={API_URL}"
+    )
     server.serve_forever()
 
 
