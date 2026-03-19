@@ -35,7 +35,9 @@ sudo nano .env
 Заполните:
 
 RW_API_URL=https://panel.example.com/api
+
 RW_API_TOKEN=ВАШ_API_TOKEN
+
 BACKUP_SQUAD_UUID=uuid_резервного_squad
 
 🐳 Запуск
