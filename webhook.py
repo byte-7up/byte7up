@@ -2,9 +2,24 @@
 import json
 import os
 import tempfile
+import zlib
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib import error, request
 from urllib.parse import urlsplit
+
+
+def getenv_int(name, default):
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+
+    try:
+        return int(value)
+    except ValueError:
+        print(f"Invalid integer for {name}: {value!r}, using {default}", flush=True)
+        return default
+
 
 STATUSES_TO_BACKUP = {"EXPIRED", "DISABLED", "LIMITED"}
 EVENTS_TO_BACKUP = {
@@ -20,10 +35,38 @@ PORT = int(os.getenv("PORT", "3000"))
 API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api").rstrip("/")
 API_TOKEN = os.getenv("RW_API_TOKEN", "YOUR_API_TOKEN")
 BACKUP_SQUAD_UUID = os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid")
+TEMP_ACTIVE_DAYS = getenv_int("TEMP_ACTIVE_DAYS", 3)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_FILE = os.path.join(BASE_DIR, "data", "original_squads.json")
 DATA_FILE = os.getenv("DATA_PATH", DEFAULT_DATA_FILE)
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/api/v1/remnawave")
+
+SUBSCRIPTION_PROFILE_ALIASES = {
+    "expire_at": (
+        "expireAt",
+        "expire_at",
+        "subscriptionExpireAt",
+        "subscription_expire_at",
+    ),
+    "traffic_limit_bytes": (
+        "trafficLimitBytes",
+        "traffic_limit_bytes",
+    ),
+    "traffic_limit_strategy": (
+        "trafficLimitStrategy",
+        "traffic_limit_strategy",
+        "trafficResetStrategy",
+        "traffic_reset_strategy",
+    ),
+    "hwid_device_limit": (
+        "hwidDeviceLimit",
+        "hwid_device_limit",
+        "deviceLimit",
+        "device_limit",
+        "maxHwidDevices",
+        "max_hwid_devices",
+    ),
+}
 
 
 def log(message):
@@ -43,6 +86,78 @@ def preview_json(data):
         return json.dumps(data, ensure_ascii=False, default=str)
     except TypeError:
         return repr(data)
+
+
+def parse_datetime_value(value):
+    if value in (None, ""):
+        return None
+
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 1_000_000_000_000:
+            timestamp /= 1000
+
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip()
+    if not normalized:
+        return None
+
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
+def format_datetime_value(value):
+    return (
+        value.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def datetimes_equal(left, right):
+    if left is None or right is None:
+        return False
+
+    return int(left.timestamp()) == int(right.timestamp())
+
+
+def normalize_json_value(value):
+    parsed_datetime = parse_datetime_value(value)
+    if parsed_datetime is not None:
+        return format_datetime_value(parsed_datetime)
+
+    if isinstance(value, dict):
+        return {
+            key: normalize_json_value(value[key])
+            for key in sorted(value)
+        }
+
+    if isinstance(value, list):
+        normalized_items = [normalize_json_value(item) for item in value]
+        return sorted(
+            normalized_items,
+            key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
+        )
+
+    return value
 
 
 def build_patch_urls(user_uuid):
@@ -110,6 +225,60 @@ def extract_squad_uuids(user):
     return []
 
 
+def extract_expire_at(user):
+    candidate_keys = (
+        "expireAt",
+        "expire_at",
+        "subscriptionExpireAt",
+        "subscription_expire_at",
+    )
+
+    for key in candidate_keys:
+        expire_at = parse_datetime_value(user.get(key))
+        if expire_at is not None:
+            return expire_at
+
+    return None
+
+
+def extract_subscription_profile(user):
+    profile = {}
+
+    for canonical_key, aliases in SUBSCRIPTION_PROFILE_ALIASES.items():
+        for alias in aliases:
+            if alias not in user:
+                continue
+
+            value = user.get(alias)
+            if value is None:
+                continue
+
+            profile[canonical_key] = normalize_json_value(value)
+            break
+
+    return profile
+
+
+def build_subscription_profile_from_expire_at(expire_at):
+    if expire_at is None:
+        return {}
+
+    return {"expire_at": format_datetime_value(expire_at)}
+
+
+def profile_matches_reference(current_profile, reference_profile):
+    if not current_profile or not reference_profile:
+        return False
+
+    for key, value in current_profile.items():
+        if key not in reference_profile:
+            return False
+        if reference_profile[key] != value:
+            return False
+
+    return True
+
+
 def infer_status(event, user):
     status = user.get("status")
     if isinstance(status, str) and status:
@@ -137,7 +306,73 @@ def squads_match(current_squads, target_squads):
     return normalize_squad_uuids(current_squads) == normalize_squad_uuids(target_squads)
 
 
-def load_original_squads():
+def build_user_state(original_squads, status="", expire_at=None):
+    user_state = {
+        "original_squads": normalize_squad_uuids(original_squads),
+    }
+
+    if status:
+        user_state["original_status"] = status
+
+    if expire_at is not None:
+        user_state["original_expire_at"] = format_datetime_value(expire_at)
+        user_state["original_subscription_profile"] = (
+            build_subscription_profile_from_expire_at(expire_at)
+        )
+
+    return user_state
+
+
+def normalize_user_state(user_uuid, raw_state):
+    if isinstance(raw_state, list):
+        return build_user_state(raw_state)
+
+    if not isinstance(raw_state, dict):
+        log(
+            f"Ignoring invalid state for user {user_uuid}: "
+            f"expected object or list, got {type(raw_state).__name__}"
+        )
+        return None
+
+    original_squads = []
+    for key in ("original_squads", "originalSquads", "squads"):
+        if key in raw_state:
+            original_squads = raw_state.get(key)
+            break
+
+    user_state = build_user_state(
+        original_squads,
+        status=raw_state.get("original_status", ""),
+        expire_at=parse_datetime_value(raw_state.get("original_expire_at")),
+    )
+
+    temporary_active_until = parse_datetime_value(
+        raw_state.get("temporary_active_until")
+        or raw_state.get("temporaryActiveUntil")
+        or raw_state.get("temporary_access_until")
+    )
+    if temporary_active_until is not None:
+        user_state["temporary_active_until"] = format_datetime_value(temporary_active_until)
+        user_state["temporary_subscription_profile"] = (
+            build_subscription_profile_from_expire_at(temporary_active_until)
+        )
+
+    original_subscription_profile = raw_state.get("original_subscription_profile")
+    if isinstance(original_subscription_profile, dict):
+        user_state["original_subscription_profile"] = normalize_json_value(
+            original_subscription_profile
+        )
+
+    temporary_subscription_profile = raw_state.get("temporary_subscription_profile")
+    if isinstance(temporary_subscription_profile, dict):
+        user_state["temporary_subscription_profile"] = normalize_json_value(
+            temporary_subscription_profile
+        )
+
+    return user_state
+
+
+def load_user_states():
     if not os.path.exists(DATA_FILE):
         return {}
 
@@ -152,13 +387,24 @@ def load_original_squads():
         log(f"State file {DATA_FILE} must contain a JSON object")
         return {}
 
-    return data
+    normalized_states = {}
+
+    for user_uuid, raw_state in data.items():
+        if not isinstance(user_uuid, str) or not user_uuid:
+            log(f"Ignoring invalid user id in state file: {preview_json(user_uuid)}")
+            continue
+
+        normalized_state = normalize_user_state(user_uuid, raw_state)
+        if normalized_state is not None:
+            normalized_states[user_uuid] = normalized_state
+
+    return normalized_states
 
 
-original_squads = load_original_squads()
+user_states = load_user_states()
 
 
-def save_original_squads():
+def save_user_states():
     directory = os.path.dirname(DATA_FILE)
     target_dir = directory or "."
     temp_path = None
@@ -173,7 +419,7 @@ def save_original_squads():
             delete=False,
         ) as file_obj:
             temp_path = file_obj.name
-            json.dump(original_squads, file_obj, indent=2, ensure_ascii=False)
+            json.dump(user_states, file_obj, indent=2, ensure_ascii=False)
             file_obj.flush()
             os.fsync(file_obj.fileno())
 
@@ -190,19 +436,12 @@ def save_original_squads():
     return True
 
 
-def patch_user_squad(user_uuid, squads):
-    payload_variants = (
-        {"uuid": user_uuid, "activeInternalSquads": squads},
-        {"uuid": user_uuid, "active_internal_squads": squads},
-        {"uuid": user_uuid, "internalSquadUuids": squads},
-        {"uuid": user_uuid, "internal_squad_uuids": squads},
-        {"uuid": user_uuid, "squadUuids": squads},
-        {"uuid": user_uuid, "squad_uuids": squads},
-    )
-
+def patch_user(user_uuid, payload_variants):
     for url in build_patch_urls(user_uuid):
         for payload in payload_variants:
-            data = json.dumps(payload).encode("utf-8")
+            request_payload = {"uuid": user_uuid}
+            request_payload.update(payload)
+            data = json.dumps(request_payload).encode("utf-8")
             req = request.Request(
                 url,
                 data=data,
@@ -217,20 +456,93 @@ def patch_user_squad(user_uuid, squads):
                 with request.urlopen(req) as resp:
                     body = resp.read().decode("utf-8", "replace")
                     log(
-                        f"PATCH {url} with {preview_json(payload)}, "
+                        f"PATCH {url} with {preview_json(request_payload)}, "
                         f"status={resp.status}, body={body}"
                     )
                     return True
             except error.HTTPError as exc:
                 body = exc.read().decode("utf-8", "replace")
                 log(
-                    f"HTTP error patching via {url} with {preview_json(payload)}: "
+                    f"HTTP error patching via {url} with {preview_json(request_payload)}: "
                     f"status={exc.code}, body={body}"
                 )
             except Exception as exc:
-                log(f"Error patching via {url} with {preview_json(payload)}: {exc}")
+                log(
+                    f"Error patching via {url} with "
+                    f"{preview_json(request_payload)}: {exc}"
+                )
 
     return False
+
+
+def patch_user_squad(user_uuid, squads):
+    payload_variants = (
+        {"activeInternalSquads": squads},
+        {"active_internal_squads": squads},
+        {"internalSquadUuids": squads},
+        {"internal_squad_uuids": squads},
+        {"squadUuids": squads},
+        {"squad_uuids": squads},
+    )
+    return patch_user(user_uuid, payload_variants)
+
+
+def patch_user_access(user_uuid, expire_at):
+    formatted_expire_at = format_datetime_value(expire_at)
+    payload_variants = (
+        {"status": "ACTIVE", "expireAt": formatted_expire_at},
+        {"status": "ACTIVE", "expire_at": formatted_expire_at},
+    )
+    return patch_user(user_uuid, payload_variants)
+
+
+def get_temporary_expire_at_offset_seconds(user_uuid):
+    # Add a tiny deterministic offset so our temporary expireAt is easy to
+    # recognize later and does not rely on webhook timing.
+    return zlib.crc32(user_uuid.encode("utf-8")) % 53 + 7
+
+
+def calculate_temporary_expire_at(user_uuid, current_expire_at):
+    minimum_expire_at = datetime.now(timezone.utc) + timedelta(days=TEMP_ACTIVE_DAYS)
+    if current_expire_at is None:
+        base_expire_at = minimum_expire_at
+    else:
+        base_expire_at = max(current_expire_at, minimum_expire_at)
+
+    return base_expire_at.replace(microsecond=0) + timedelta(
+        seconds=get_temporary_expire_at_offset_seconds(user_uuid)
+    )
+
+
+def build_temporary_subscription_profile(original_profile, temporary_expire_at):
+    temporary_profile = dict(original_profile)
+    temporary_profile["expire_at"] = format_datetime_value(temporary_expire_at)
+    return temporary_profile
+
+
+def should_restore_original_squads(user_state, current_profile):
+    if not current_profile:
+        return False
+
+    temporary_profile = user_state.get("temporary_subscription_profile") or {}
+    if profile_matches_reference(current_profile, temporary_profile):
+        return False
+
+    original_profile = user_state.get("original_subscription_profile") or {}
+    if profile_matches_reference(current_profile, original_profile):
+        return False
+
+    if temporary_profile or original_profile:
+        return True
+
+    if "expire_at" not in current_profile:
+        return False
+
+    original_expire_at = parse_datetime_value(user_state.get("original_expire_at"))
+    if original_expire_at is None:
+        return True
+
+    return current_profile["expire_at"] != format_datetime_value(original_expire_at)
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -286,56 +598,148 @@ class WebhookHandler(BaseHTTPRequestHandler):
         username = user.get("username") or user.get("email") or user_uuid
         status = infer_status(event, user)
         squad_uuids = extract_squad_uuids(user)
+        expire_at = extract_expire_at(user)
+        subscription_profile = extract_subscription_profile(user)
 
         log(
             f"Webhook received: event={event or 'unknown'}, "
-            f"user={username}, status={status or 'unknown'}, squads={squad_uuids}"
+            f"user={username}, status={status or 'unknown'}, "
+            f"squads={squad_uuids}, expireAt={format_datetime_value(expire_at) if expire_at else 'unknown'}, "
+            f"subscriptionProfile={preview_json(subscription_profile)}"
         )
 
         if status in STATUSES_TO_BACKUP:
             target_squads = [BACKUP_SQUAD_UUID]
+            user_state = user_states.get(user_uuid)
+            already_on_backup = squads_match(squad_uuids, target_squads)
 
             if not squad_uuids:
                 log(f"User {username} has no squads in payload, skipping backup")
                 self._send_text(200, "Ignored")
                 return
 
-            if squads_match(squad_uuids, target_squads):
-                if user_uuid in original_squads:
+            if user_state is None:
+                if already_on_backup:
                     log(
                         f"User {username} already has target squads {target_squads}, "
-                        f"skipping repeat patch"
+                        f"but original squads are not saved"
                     )
-                else:
-                    log(
-                        f"User {username} already has target squads {target_squads}, "
-                        f"skipping patch"
-                    )
-                self._send_text(200, "Ignored")
-                return
+                    self._send_text(200, "Ignored")
+                    return
 
-            if user_uuid not in original_squads:
-                original_squads[user_uuid] = list(squad_uuids)
-                if not save_original_squads():
-                    original_squads.pop(user_uuid, None)
+                user_state = build_user_state(squad_uuids, status=status, expire_at=expire_at)
+                if subscription_profile:
+                    user_state["original_subscription_profile"] = dict(subscription_profile)
+                user_states[user_uuid] = user_state
+                if not save_user_states():
+                    user_states.pop(user_uuid, None)
                     self._send_text(500, "Failed to save original squads")
                     return
 
                 log(f"Saved original squads for {username}: {squad_uuids}")
+            else:
+                state_changed = False
 
-            if not patch_user_squad(user_uuid, target_squads):
+                if not user_state.get("original_squads") and not already_on_backup:
+                    user_state["original_squads"] = list(normalize_squad_uuids(squad_uuids))
+                    state_changed = True
+
+                if status and not user_state.get("original_status"):
+                    user_state["original_status"] = status
+                    state_changed = True
+
+                if expire_at is not None and not user_state.get("original_expire_at"):
+                    user_state["original_expire_at"] = format_datetime_value(expire_at)
+                    state_changed = True
+
+                if subscription_profile and not user_state.get("original_subscription_profile"):
+                    user_state["original_subscription_profile"] = dict(subscription_profile)
+                    state_changed = True
+
+                if state_changed and not save_user_states():
+                    self._send_text(500, "Failed to update local state")
+                    return
+
+            if already_on_backup:
+                log(
+                    f"User {username} already has target squads {target_squads}, "
+                    f"skipping squad patch"
+                )
+            elif not patch_user_squad(user_uuid, target_squads):
                 self._send_text(502, "Failed to patch user")
                 return
 
-        elif status == "ACTIVE":
-            squads_to_restore = original_squads.get(user_uuid)
-            if squads_to_restore is None:
+            if TEMP_ACTIVE_DAYS > 0:
+                temporary_active_until = parse_datetime_value(
+                    user_state.get("temporary_active_until")
+                )
+                if temporary_active_until is None:
+                    temporary_expire_at = calculate_temporary_expire_at(
+                        user_uuid,
+                        expire_at,
+                    )
+                    user_state["temporary_active_until"] = format_datetime_value(
+                        temporary_expire_at
+                    )
+                    original_profile = user_state.get("original_subscription_profile") or {}
+                    user_state["temporary_subscription_profile"] = (
+                        build_temporary_subscription_profile(
+                            original_profile,
+                            temporary_expire_at,
+                        )
+                    )
+
+                    if not patch_user_access(user_uuid, temporary_expire_at):
+                        user_state.pop("temporary_active_until", None)
+                        user_state.pop("temporary_subscription_profile", None)
+                        self._send_text(502, "Failed to activate user temporarily")
+                        return
+
+                    if not save_user_states():
+                        self._send_text(500, "Failed to update local state")
+                        return
+
+                    log(
+                        f"Temporarily activated {username} until "
+                        f"{user_state['temporary_active_until']}"
+                    )
+                else:
+                    log(
+                        f"Temporary ACTIVE access already granted for {username} until "
+                        f"{user_state['temporary_active_until']}, leaving current state"
+                    )
+
+        else:
+            user_state = user_states.get(user_uuid)
+            should_try_restore = (
+                user_state is not None
+                and (
+                    status == "ACTIVE"
+                    or event == "user.modified"
+                )
+            )
+
+            if not should_try_restore:
+                log(
+                    f"Ignoring event={event or 'unknown'} status={status or 'unknown'} "
+                    f"for {username}"
+                )
+                self._send_text(200, "OK")
+                return
+
+            if user_state is None:
                 log(f"No saved squads for {username}, nothing to restore")
             else:
+                squads_to_restore = user_state.get("original_squads") or []
+                if not squads_to_restore:
+                    log(f"Saved state for {username} has no original squads, nothing to restore")
+                    self._send_text(200, "Ignored")
+                    return
+
                 if squads_match(squad_uuids, squads_to_restore):
-                    original_squads.pop(user_uuid, None)
-                    if not save_original_squads():
-                        original_squads[user_uuid] = squads_to_restore
+                    user_states.pop(user_uuid, None)
+                    if not save_user_states():
+                        user_states[user_uuid] = user_state
                         self._send_text(500, "Failed to update local state")
                         return
 
@@ -343,21 +747,25 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         f"Original squads already restored for {username}: "
                         f"{squads_to_restore}"
                     )
+                elif not should_restore_original_squads(user_state, subscription_profile):
+                    log(
+                        f"User {username} has no real subscription change yet; "
+                        f"keeping backup squad until a real subscription change is detected"
+                    )
+                    self._send_text(200, "Ignored")
+                    return
                 else:
                     if not patch_user_squad(user_uuid, squads_to_restore):
                         self._send_text(502, "Failed to restore user squads")
                         return
 
-                    original_squads.pop(user_uuid, None)
-                    if not save_original_squads():
-                        original_squads[user_uuid] = squads_to_restore
+                    user_states.pop(user_uuid, None)
+                    if not save_user_states():
+                        user_states[user_uuid] = user_state
                         self._send_text(500, "Failed to update local state")
                         return
 
                     log(f"Restored original squads for {username}: {squads_to_restore}")
-
-        else:
-            log(f"Ignoring event={event or 'unknown'} status={status or 'unknown'} for {username}")
 
         self._send_text(200, "OK")
 
@@ -366,7 +774,7 @@ def run():
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     log(
         f"Webhook server running on port {PORT}, path {normalize_path(WEBHOOK_PATH)}, "
-        f"api_url={API_URL}"
+        f"api_url={API_URL}, temp_active_days={TEMP_ACTIVE_DAYS}"
     )
     server.serve_forever()
 

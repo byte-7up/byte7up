@@ -1,12 +1,15 @@
 services:
   remnawave-switch-squads:
-    image: docker.io/byte7up/remnawave-switch-squads:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: remnawave-switch-squads
     restart: unless-stopped
     environment:
       - RW_API_URL=${RW_API_URL}
       - RW_API_TOKEN=${RW_API_TOKEN}
       - BACKUP_SQUAD_UUID=${BACKUP_SQUAD_UUID}
+      - TEMP_ACTIVE_DAYS=${TEMP_ACTIVE_DAYS}
       - WEBHOOK_PATH=${WEBHOOK_PATH}
       - PORT=${PORT}
       - DATA_PATH=/data/original_squads.json

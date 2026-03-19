@@ -7,4 +7,6 @@ RUN mkdir -p /data
 ENV PORT=3000
 ENV PYTHONUNBUFFERED=1
 
+EXPOSE 3000
+
 CMD ["python", "webhook.py"]
