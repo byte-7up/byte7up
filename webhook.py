@@ -658,7 +658,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
             f"subscriptionProfile={preview_json(subscription_profile)}"
         )
 
-        if status in STATUSES_TO_BACKUP:
+        should_handle_backup = (
+            event in EVENTS_TO_BACKUP
+            or (not event and status in STATUSES_TO_BACKUP)
+        )
+
+        if should_handle_backup:
             target_squads = [BACKUP_SQUAD_UUID]
             user_state = user_states.get(user_uuid)
             already_on_backup = squads_match(squad_uuids, target_squads)
@@ -710,15 +715,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     self._send_text(500, "Failed to update local state")
                     return
 
-            if already_on_backup:
-                log(
-                    f"User {username} already has target squads {target_squads}, "
-                    f"skipping squad patch"
-                )
-            elif not patch_user_squad(user_uuid, target_squads):
-                self._send_text(502, "Failed to patch user")
-                return
-
             if TEMP_ACTIVE_DAYS > 0:
                 temporary_active_until = parse_datetime_value(
                     user_state.get("temporary_active_until")
@@ -758,6 +754,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         f"Temporary ACTIVE access already granted for {username} until "
                         f"{user_state['temporary_active_until']}, leaving current state"
                     )
+
+            if already_on_backup:
+                log(
+                    f"User {username} already has target squads {target_squads}, "
+                    f"skipping squad patch"
+                )
+            elif not patch_user_squad(user_uuid, target_squads):
+                self._send_text(502, "Failed to patch user")
+                return
 
         else:
             user_state = user_states.get(user_uuid)
