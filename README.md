@@ -26,6 +26,8 @@ sudo mkdir -p /opt/remnawave-switch-squads && cd /opt/remnawave-switch-squads
 Скачиваем файлы из репозитория
 ```bash
 sudo wget -O .env https://raw.githubusercontent.com/byte-7up/byte7up/main/.env.example
+```
+```
 sudo wget -O docker-compose.yml https://raw.githubusercontent.com/byte-7up/byte7up/main/docker-compose.yml
 sudo wget -O webhook.py https://raw.githubusercontent.com/byte-7up/byte7up/main/webhook.py
 sudo wget -O Dockerfile https://raw.githubusercontent.com/byte-7up/byte7up/main/Dockerfile
@@ -40,7 +42,9 @@ sudo nano .env
 
 ```env
 RW_API_URL=https://panel.example.com/api
+
 RW_API_TOKEN=ВАШ_API_TOKEN
+
 BACKUP_SQUAD_UUID=uuid_резервного_squad
 TEMP_ACTIVE_DAYS=3
 WEBHOOK_PATH=/api/v1/remnawave
@@ -56,7 +60,7 @@ docker compose up -d --build && docker compose logs -f -t
 
 🔗 Настройка webhook в панели Remnawave
 
-В панели Remnawave:
+В .env панели Remnawave:
 
 Webhook URL:
 ```text
@@ -70,6 +74,10 @@ https://your-domain/api/v1/remnawave
 cd /opt/remnawave-switch-squads && docker compose up -d --build && docker compose logs -f
 ```
 
+Обновление:
+```
+cd /opt/remnawave-switch-squads && docker compose pull && docker compose down && docker compose up -d && docker compose logs -f
+```
 📌 Что делает сервис
 
 Когда пользователь получает статус:
