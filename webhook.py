@@ -142,12 +142,14 @@ def save_original_squads():
 
 
 def patch_user_squad(user_uuid, squads):
-    url = f"{API_URL}/users/{user_uuid}"
+    url = f"{API_URL}/users"
     payload_variants = (
-        {"activeInternalSquads": squads},
-        {"active_internal_squads": squads},
-        {"squadUuids": squads},
-        {"squad_uuids": squads},
+        {"uuid": user_uuid, "activeInternalSquads": squads},
+        {"uuid": user_uuid, "active_internal_squads": squads},
+        {"uuid": user_uuid, "internalSquadUuids": squads},
+        {"uuid": user_uuid, "internal_squad_uuids": squads},
+        {"uuid": user_uuid, "squadUuids": squads},
+        {"uuid": user_uuid, "squad_uuids": squads},
     )
 
     for payload in payload_variants:
