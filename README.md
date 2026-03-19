@@ -1,4 +1,4 @@
-# Remnawave Webhook Handler
+# remnawave-switch-squads
 
 Лёгкий Python‑сервис для обработки webhook от **Remnawave** —  
 он автоматически:
@@ -18,7 +18,7 @@ sudo curl -fsSL https://get.docker.com | sh
 
 Создаём рабочую папку
 
-sudo mkdir -p /opt/remnawave-webhook && cd /opt/remnawave-webhook
+sudo mkdir -p /opt/remnawave-switch-squads && cd /opt/remnawave-switch-squads
 
 Скачиваем файлы из репозитория
 

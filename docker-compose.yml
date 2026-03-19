@@ -1,7 +1,7 @@
 services:
-  remna-webhook:
-    build: .
-    container_name: remna-webhook
+  remnawave-switch-squads:
+    image: docker.io/your-dockerhub-username/remnawave-switch-squads:latest
+    container_name: remnawave-switch-squads
     restart: unless-stopped
     environment:
       - RW_API_URL=${RW_API_URL}
@@ -11,14 +11,14 @@ services:
       - PORT=${PORT}
       - DATA_PATH=/data/original_squads.json
     volumes:
-      - webhook_data:/data
+      - remnawave-switch-squads-data:/data
     ports:
       - "${BIND_HOST:-127.0.0.1}:${HOST_PORT:-3002}:${PORT:-3000}"
     networks:
       - remnawave-network
 
 volumes:
-  webhook_data:
+  remnawave-switch-squads-data:
 
 networks:
   remnawave-network:
