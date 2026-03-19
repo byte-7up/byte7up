@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib import error, request
 from urllib.parse import urlsplit
@@ -159,15 +160,31 @@ original_squads = load_original_squads()
 
 def save_original_squads():
     directory = os.path.dirname(DATA_FILE)
+    target_dir = directory or "."
+    temp_path = None
 
     try:
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+        os.makedirs(target_dir, exist_ok=True)
 
-        with open(DATA_FILE, "w", encoding="utf-8") as file_obj:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=target_dir,
+            delete=False,
+        ) as file_obj:
+            temp_path = file_obj.name
             json.dump(original_squads, file_obj, indent=2, ensure_ascii=False)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+
+        os.replace(temp_path, DATA_FILE)
     except OSError as exc:
         log(f"Failed to save state file {DATA_FILE}: {exc}")
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         return False
 
     return True
