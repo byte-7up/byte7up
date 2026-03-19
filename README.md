@@ -3,7 +3,7 @@
 Лёгкий Python‑сервис для обработки webhook от **Remnawave** —  
 он автоматически:
 
-- Переключает пользователя на резервный squad при статусах **EXPIRED**, **DISABLED**, **LIMITED**
+- Переключает пользователя на резервный squad при статусах **EXPIRED**, **LIMITED**  
 - Временно переводит пользователя в **ACTIVE** на несколько дней
 - Возвращает оригинальный squad после покупки / продления / изменения подписки
 - Сохраняет состояние пользователей между перезапусками через Docker volume
@@ -43,6 +43,7 @@ RW_API_TOKEN=ВАШ_API_TOKEN
 
 BACKUP_SQUAD_UUID=uuid_резервного_squad
 TEMP_ACTIVE_DAYS=3
+TEMP_ACTIVE_TRAFFIC_LIMIT_MB=300
 WEBHOOK_PATH=/api/v1/remnawave
 PORT=3000
 ```
@@ -73,7 +74,7 @@ cd /opt/remnawave-switch-squads && docker compose pull && docker compose down &&
 
 Когда пользователь получает статус:
 
-`EXPIRED / DISABLED / LIMITED`  
+`EXPIRED / LIMITED`  
 Сохраняется original squad, пользователь переключается на резервный squad и временно переводится в `ACTIVE`
 
 При покупке / продлении / изменении подписки  

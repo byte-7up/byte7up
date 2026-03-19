@@ -21,14 +21,16 @@ def getenv_int(name, default):
         return default
 
 
-STATUSES_TO_BACKUP = {"EXPIRED", "DISABLED", "LIMITED"}
+STATUSES_TO_BACKUP = {"EXPIRED", "LIMITED"}
 EVENTS_TO_BACKUP = {
-    "user.disabled": "DISABLED",
     "user.expired": "EXPIRED",
     "user.limited": "LIMITED",
 }
 EVENTS_TO_RESTORE = {
     "user.enabled": "ACTIVE",
+}
+SUPPORTED_USER_EVENTS = set(EVENTS_TO_BACKUP) | set(EVENTS_TO_RESTORE) | {
+    "user.modified",
 }
 
 PORT = int(os.getenv("PORT", "3000"))
@@ -36,6 +38,12 @@ API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api").rstrip("/")
 API_TOKEN = os.getenv("RW_API_TOKEN", "YOUR_API_TOKEN")
 BACKUP_SQUAD_UUID = os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid")
 TEMP_ACTIVE_DAYS = getenv_int("TEMP_ACTIVE_DAYS", 3)
+TEMP_ACTIVE_TRAFFIC_LIMIT_MB = max(0, getenv_int("TEMP_ACTIVE_TRAFFIC_LIMIT_MB", 300))
+TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES = (
+    TEMP_ACTIVE_TRAFFIC_LIMIT_MB * 1024 * 1024
+    if TEMP_ACTIVE_TRAFFIC_LIMIT_MB > 0
+    else None
+)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_FILE = os.path.join(BASE_DIR, "data", "original_squads.json")
 DATA_FILE = os.getenv("DATA_PATH", DEFAULT_DATA_FILE)
@@ -121,6 +129,29 @@ def parse_datetime_value(value):
         parsed = parsed.replace(tzinfo=timezone.utc)
 
     return parsed.astimezone(timezone.utc)
+
+
+def parse_int_value(value):
+    if value in (None, "") or isinstance(value, bool):
+        return None
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        return int(value)
+
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+
+        try:
+            return int(normalized)
+        except ValueError:
+            return None
+
+    return None
 
 
 def format_datetime_value(value):
@@ -264,6 +295,29 @@ def extract_subscription_profile(user):
             break
 
     return profile
+
+
+def extract_used_traffic_bytes(user):
+    candidate_values = [
+        user.get("usedTrafficBytes"),
+        user.get("used_traffic_bytes"),
+    ]
+
+    nested_user_traffic = user.get("userTraffic") or user.get("user_traffic")
+    if isinstance(nested_user_traffic, dict):
+        candidate_values.extend(
+            (
+                nested_user_traffic.get("usedTrafficBytes"),
+                nested_user_traffic.get("used_traffic_bytes"),
+            )
+        )
+
+    for candidate_value in candidate_values:
+        used_traffic_bytes = parse_int_value(candidate_value)
+        if used_traffic_bytes is not None:
+            return max(0, used_traffic_bytes)
+
+    return None
 
 
 def build_subscription_profile_from_expire_at(expire_at):
@@ -521,11 +575,44 @@ def patch_user_squad(user_uuid, squads):
     return patch_user(user_uuid, payload_variants)
 
 
-def patch_user_access(user_uuid, expire_at):
+def patch_user_access(user_uuid, expire_at, traffic_limit_bytes=None, traffic_limit_strategy=""):
     formatted_expire_at = format_datetime_value(expire_at)
+    primary_payload = {"status": "ACTIVE", "expireAt": formatted_expire_at}
+    fallback_payload = {"status": "ACTIVE", "expire_at": formatted_expire_at}
+
+    if traffic_limit_bytes is not None:
+        primary_payload["trafficLimitBytes"] = traffic_limit_bytes
+        fallback_payload["traffic_limit_bytes"] = traffic_limit_bytes
+
+        if traffic_limit_strategy:
+            primary_payload["trafficLimitStrategy"] = traffic_limit_strategy
+            fallback_payload["traffic_limit_strategy"] = traffic_limit_strategy
+
     payload_variants = (
-        {"status": "ACTIVE", "expireAt": formatted_expire_at},
-        {"status": "ACTIVE", "expire_at": formatted_expire_at},
+        primary_payload,
+        fallback_payload,
+    )
+    return patch_user(user_uuid, payload_variants)
+
+
+def patch_user_traffic_settings(user_uuid, traffic_limit_bytes=None, traffic_limit_strategy=""):
+    primary_payload = {}
+    fallback_payload = {}
+
+    if traffic_limit_bytes is not None:
+        primary_payload["trafficLimitBytes"] = traffic_limit_bytes
+        fallback_payload["traffic_limit_bytes"] = traffic_limit_bytes
+
+    if traffic_limit_strategy:
+        primary_payload["trafficLimitStrategy"] = traffic_limit_strategy
+        fallback_payload["traffic_limit_strategy"] = traffic_limit_strategy
+
+    if not primary_payload:
+        return True
+
+    payload_variants = (
+        primary_payload,
+        fallback_payload,
     )
     return patch_user(user_uuid, payload_variants)
 
@@ -548,10 +635,70 @@ def calculate_temporary_expire_at(user_uuid, current_expire_at):
     )
 
 
-def build_temporary_subscription_profile(original_profile, temporary_expire_at):
+def calculate_temporary_traffic_limit_bytes(original_profile, used_traffic_bytes):
+    if TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES is None:
+        return None
+
+    original_traffic_limit_bytes = parse_int_value(
+        (original_profile or {}).get("traffic_limit_bytes")
+    )
+
+    if used_traffic_bytes is None:
+        baseline_traffic_bytes = max(0, original_traffic_limit_bytes or 0)
+    else:
+        baseline_traffic_bytes = max(0, used_traffic_bytes)
+
+    return baseline_traffic_bytes + TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES
+
+
+def build_temporary_subscription_profile(
+    original_profile,
+    temporary_expire_at,
+    traffic_limit_bytes=None,
+    traffic_limit_strategy="",
+):
     temporary_profile = dict(original_profile)
     temporary_profile["expire_at"] = format_datetime_value(temporary_expire_at)
+    if traffic_limit_bytes is not None:
+        temporary_profile["traffic_limit_bytes"] = traffic_limit_bytes
+        if traffic_limit_strategy:
+            temporary_profile["traffic_limit_strategy"] = traffic_limit_strategy
     return temporary_profile
+
+
+def build_original_access_restore_settings(user_state, current_profile):
+    if not current_profile:
+        return {}
+
+    original_profile = user_state.get("original_subscription_profile") or {}
+    temporary_profile = user_state.get("temporary_subscription_profile") or {}
+    settings_to_restore = {}
+
+    current_traffic_limit_bytes = parse_int_value(current_profile.get("traffic_limit_bytes"))
+    temporary_traffic_limit_bytes = parse_int_value(
+        temporary_profile.get("traffic_limit_bytes")
+    )
+    if (
+        temporary_traffic_limit_bytes is not None
+        and current_traffic_limit_bytes == temporary_traffic_limit_bytes
+        and "traffic_limit_bytes" in original_profile
+    ):
+        settings_to_restore["traffic_limit_bytes"] = parse_int_value(
+            original_profile.get("traffic_limit_bytes")
+        ) or 0
+
+    current_traffic_limit_strategy = current_profile.get("traffic_limit_strategy")
+    temporary_traffic_limit_strategy = temporary_profile.get("traffic_limit_strategy")
+    if (
+        temporary_traffic_limit_strategy
+        and current_traffic_limit_strategy == temporary_traffic_limit_strategy
+        and "traffic_limit_strategy" in original_profile
+    ):
+        settings_to_restore["traffic_limit_strategy"] = (
+            original_profile.get("traffic_limit_strategy") or ""
+        )
+
+    return settings_to_restore
 
 
 def should_restore_original_squads(user_state, current_profile):
@@ -618,6 +765,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
         event = payload.get("event", "")
         user = payload.get("data")
 
+        if isinstance(event, str) and event and not event.startswith("user."):
+            log(f"Ignoring non-user event={event}")
+            self._send_text(200, "Ignored")
+            return
+
         if not isinstance(user, dict):
             log(f"Ignoring webhook with unexpected data payload: {preview_json(payload)}")
             self._send_text(200, "Ignored")
@@ -634,6 +786,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
         squad_uuids = extract_squad_uuids(user)
         expire_at = extract_expire_at(user)
         subscription_profile = extract_subscription_profile(user)
+        used_traffic_bytes = extract_used_traffic_bytes(user)
+
+        if event and event not in SUPPORTED_USER_EVENTS:
+            log(f"Ignoring unsupported user event={event} for {username}")
+            self._send_text(200, "Ignored")
+            return
 
         log(
             f"Webhook received: event={event or 'unknown'}, "
@@ -712,14 +870,30 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         temporary_expire_at
                     )
                     original_profile = user_state.get("original_subscription_profile") or {}
+                    temporary_traffic_limit_bytes = calculate_temporary_traffic_limit_bytes(
+                        original_profile,
+                        used_traffic_bytes,
+                    )
+                    temporary_traffic_limit_strategy = (
+                        "NO_RESET"
+                        if temporary_traffic_limit_bytes is not None
+                        else (original_profile.get("traffic_limit_strategy") or "")
+                    )
                     user_state["temporary_subscription_profile"] = (
                         build_temporary_subscription_profile(
                             original_profile,
                             temporary_expire_at,
+                            traffic_limit_bytes=temporary_traffic_limit_bytes,
+                            traffic_limit_strategy=temporary_traffic_limit_strategy,
                         )
                     )
 
-                    if not patch_user_access(user_uuid, temporary_expire_at):
+                    if not patch_user_access(
+                        user_uuid,
+                        temporary_expire_at,
+                        traffic_limit_bytes=temporary_traffic_limit_bytes,
+                        traffic_limit_strategy=temporary_traffic_limit_strategy,
+                    ):
                         user_state.pop("temporary_active_until", None)
                         user_state.pop("temporary_subscription_profile", None)
                         self._send_text(502, "Failed to activate user temporarily")
@@ -791,7 +965,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     )
                     self._send_text(200, "Ignored")
                     return
-                elif squads_match(squad_uuids, squads_to_restore):
+                restore_access_settings = build_original_access_restore_settings(
+                    user_state,
+                    subscription_profile,
+                )
+
+                if squads_match(squad_uuids, squads_to_restore):
+                    if restore_access_settings and not patch_user_traffic_settings(
+                        user_uuid,
+                        traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
+                        traffic_limit_strategy=restore_access_settings.get(
+                            "traffic_limit_strategy", ""
+                        ),
+                    ):
+                        log(
+                            f"Failed to restore original access settings for {username}: "
+                            f"{preview_json(restore_access_settings)}; "
+                            f"acknowledging webhook to retry on the next user event"
+                        )
+                        self._send_text(200, "Failed to restore user access settings")
+                        return
+
                     user_states.pop(user_uuid, None)
                     if not save_user_states():
                         user_states[user_uuid] = user_state
@@ -811,6 +1005,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         self._send_text(200, "Failed to restore user squads")
                         return
 
+                    if restore_access_settings and not patch_user_traffic_settings(
+                        user_uuid,
+                        traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
+                        traffic_limit_strategy=restore_access_settings.get(
+                            "traffic_limit_strategy", ""
+                        ),
+                    ):
+                        log(
+                            f"Failed to restore original access settings for {username}: "
+                            f"{preview_json(restore_access_settings)}; "
+                            f"acknowledging webhook to retry on the next user event"
+                        )
+                        self._send_text(200, "Failed to restore user access settings")
+                        return
+
                     user_states.pop(user_uuid, None)
                     if not save_user_states():
                         user_states[user_uuid] = user_state
@@ -826,7 +1035,8 @@ def run():
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     log(
         f"Webhook server running on port {PORT}, path {normalize_path(WEBHOOK_PATH)}, "
-        f"api_url={API_URL}, temp_active_days={TEMP_ACTIVE_DAYS}"
+        f"api_url={API_URL}, temp_active_days={TEMP_ACTIVE_DAYS}, "
+        f"temp_active_traffic_limit_mb={TEMP_ACTIVE_TRAFFIC_LIMIT_MB}"
     )
     server.serve_forever()
 
