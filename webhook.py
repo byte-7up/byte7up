@@ -123,6 +123,19 @@ def infer_status(event, user):
     return ""
 
 
+def normalize_squad_uuids(squad_uuids):
+    normalized = {
+        squad_uuid
+        for squad_uuid in ensure_list(squad_uuids)
+        if isinstance(squad_uuid, str) and squad_uuid
+    }
+    return sorted(normalized)
+
+
+def squads_match(current_squads, target_squads):
+    return normalize_squad_uuids(current_squads) == normalize_squad_uuids(target_squads)
+
+
 def load_original_squads():
     if not os.path.exists(DATA_FILE):
         return {}
@@ -263,8 +276,24 @@ class WebhookHandler(BaseHTTPRequestHandler):
         )
 
         if status in STATUSES_TO_BACKUP:
+            target_squads = [BACKUP_SQUAD_UUID]
+
             if not squad_uuids:
                 log(f"User {username} has no squads in payload, skipping backup")
+                self._send_text(200, "Ignored")
+                return
+
+            if squads_match(squad_uuids, target_squads):
+                if user_uuid in original_squads:
+                    log(
+                        f"User {username} already has target squads {target_squads}, "
+                        f"skipping repeat patch"
+                    )
+                else:
+                    log(
+                        f"User {username} already has target squads {target_squads}, "
+                        f"skipping patch"
+                    )
                 self._send_text(200, "Ignored")
                 return
 
@@ -277,7 +306,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
                 log(f"Saved original squads for {username}: {squad_uuids}")
 
-            if not patch_user_squad(user_uuid, [BACKUP_SQUAD_UUID]):
+            if not patch_user_squad(user_uuid, target_squads):
                 self._send_text(502, "Failed to patch user")
                 return
 
@@ -286,17 +315,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
             if squads_to_restore is None:
                 log(f"No saved squads for {username}, nothing to restore")
             else:
-                if not patch_user_squad(user_uuid, squads_to_restore):
-                    self._send_text(502, "Failed to restore user squads")
-                    return
+                if squads_match(squad_uuids, squads_to_restore):
+                    original_squads.pop(user_uuid, None)
+                    if not save_original_squads():
+                        original_squads[user_uuid] = squads_to_restore
+                        self._send_text(500, "Failed to update local state")
+                        return
 
-                original_squads.pop(user_uuid, None)
-                if not save_original_squads():
-                    original_squads[user_uuid] = squads_to_restore
-                    self._send_text(500, "Failed to update local state")
-                    return
+                    log(
+                        f"Original squads already restored for {username}: "
+                        f"{squads_to_restore}"
+                    )
+                else:
+                    if not patch_user_squad(user_uuid, squads_to_restore):
+                        self._send_text(502, "Failed to restore user squads")
+                        return
 
-                log(f"Restored original squads for {username}: {squads_to_restore}")
+                    original_squads.pop(user_uuid, None)
+                    if not save_original_squads():
+                        original_squads[user_uuid] = squads_to_restore
+                        self._send_text(500, "Failed to update local state")
+                        return
+
+                    log(f"Restored original squads for {username}: {squads_to_restore}")
 
         else:
             log(f"Ignoring event={event or 'unknown'} status={status or 'unknown'} for {username}")
