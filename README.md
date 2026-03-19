@@ -23,6 +23,8 @@ sudo mkdir -p /opt/remnawave-switch-squads && cd /opt/remnawave-switch-squads
 Скачиваем файлы из репозитория
 ```
 sudo wget -O .env https://raw.githubusercontent.com/byte-7up/byte7up/main/.env.example
+```
+```
 sudo wget -O docker-compose.yml https://raw.githubusercontent.com/byte-7up/byte7up/main/docker-compose.yml
 ```
 
