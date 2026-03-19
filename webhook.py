@@ -169,8 +169,8 @@ def build_patch_urls(user_uuid):
 
     urls = []
     for base_url in base_urls:
+        urls.append(f"{base_url}/users/")
         urls.append(f"{base_url}/users")
-        urls.append(f"{base_url}/users/{user_uuid}")
 
     unique_urls = []
     for url in urls:
@@ -517,24 +517,8 @@ def patch_user(user_uuid, payload_variants, response_validator=None):
 def patch_user_squad(user_uuid, squads):
     payload_variants = (
         {"activeInternalSquads": squads},
-        {"active_internal_squads": squads},
-        {"internalSquadUuids": squads},
-        {"internal_squad_uuids": squads},
-        {"squadUuids": squads},
-        {"squad_uuids": squads},
     )
-
-    def squad_patch_applied(_, response_user):
-        if not isinstance(response_user, dict):
-            return True
-
-        response_squads = extract_squad_uuids(response_user)
-        if not response_squads:
-            return True
-
-        return squads_match(response_squads, squads)
-
-    return patch_user(user_uuid, payload_variants, response_validator=squad_patch_applied)
+    return patch_user(user_uuid, payload_variants)
 
 
 def patch_user_access(user_uuid, expire_at):
@@ -761,7 +745,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     f"skipping squad patch"
                 )
             elif not patch_user_squad(user_uuid, target_squads):
-                self._send_text(502, "Failed to patch user")
+                log(
+                    f"Failed to switch {username} to backup squads {target_squads}; "
+                    f"acknowledging webhook to avoid retry loop"
+                )
+                self._send_text(200, "Failed to patch user")
                 return
 
         else:
@@ -816,7 +804,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     )
                 else:
                     if not patch_user_squad(user_uuid, squads_to_restore):
-                        self._send_text(502, "Failed to restore user squads")
+                        log(
+                            f"Failed to restore original squads for {username}: "
+                            f"{squads_to_restore}; acknowledging webhook to avoid retry loop"
+                        )
+                        self._send_text(200, "Failed to restore user squads")
                         return
 
                     user_states.pop(user_uuid, None)
