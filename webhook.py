@@ -140,9 +140,10 @@ def datetimes_equal(left, right):
 
 
 def normalize_json_value(value):
-    parsed_datetime = parse_datetime_value(value)
-    if parsed_datetime is not None:
-        return format_datetime_value(parsed_datetime)
+    if isinstance(value, str):
+        parsed_datetime = parse_datetime_value(value)
+        if parsed_datetime is not None:
+            return format_datetime_value(parsed_datetime)
 
     if isinstance(value, dict):
         return {
@@ -253,7 +254,13 @@ def extract_subscription_profile(user):
             if value is None:
                 continue
 
-            profile[canonical_key] = normalize_json_value(value)
+            if canonical_key == "expire_at":
+                parsed_expire_at = parse_datetime_value(value)
+                if parsed_expire_at is None:
+                    continue
+                profile[canonical_key] = format_datetime_value(parsed_expire_at)
+            else:
+                profile[canonical_key] = normalize_json_value(value)
             break
 
     return profile
@@ -436,7 +443,27 @@ def save_user_states():
     return True
 
 
-def patch_user(user_uuid, payload_variants):
+def extract_response_user(response_body):
+    try:
+        payload = json.loads(response_body)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    response_user = payload.get("response")
+    if isinstance(response_user, dict):
+        return response_user
+
+    data_user = payload.get("data")
+    if isinstance(data_user, dict):
+        return data_user
+
+    return payload if "uuid" in payload else None
+
+
+def patch_user(user_uuid, payload_variants, response_validator=None):
     for url in build_patch_urls(user_uuid):
         for payload in payload_variants:
             request_payload = {"uuid": user_uuid}
@@ -455,6 +482,18 @@ def patch_user(user_uuid, payload_variants):
             try:
                 with request.urlopen(req) as resp:
                     body = resp.read().decode("utf-8", "replace")
+                    response_user = extract_response_user(body)
+
+                    if response_validator is not None:
+                        is_valid = response_validator(request_payload, response_user)
+                        if not is_valid:
+                            log(
+                                f"PATCH {url} with {preview_json(request_payload)} "
+                                f"returned 200 but did not apply expected changes; "
+                                f"trying next payload variant"
+                            )
+                            continue
+
                     log(
                         f"PATCH {url} with {preview_json(request_payload)}, "
                         f"status={resp.status}, body={body}"
@@ -484,7 +523,18 @@ def patch_user_squad(user_uuid, squads):
         {"squadUuids": squads},
         {"squad_uuids": squads},
     )
-    return patch_user(user_uuid, payload_variants)
+
+    def squad_patch_applied(_, response_user):
+        if not isinstance(response_user, dict):
+            return True
+
+        response_squads = extract_squad_uuids(response_user)
+        if not response_squads:
+            return True
+
+        return squads_match(response_squads, squads)
+
+    return patch_user(user_uuid, payload_variants, response_validator=squad_patch_applied)
 
 
 def patch_user_access(user_uuid, expire_at):
@@ -736,7 +786,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     self._send_text(200, "Ignored")
                     return
 
-                if squads_match(squad_uuids, squads_to_restore):
+                real_subscription_change_detected = should_restore_original_squads(
+                    user_state,
+                    subscription_profile,
+                )
+
+                if not real_subscription_change_detected:
+                    log(
+                        f"User {username} has no real subscription change yet; "
+                        f"keeping backup squad until a real subscription change is detected"
+                    )
+                    self._send_text(200, "Ignored")
+                    return
+                elif squads_match(squad_uuids, squads_to_restore):
                     user_states.pop(user_uuid, None)
                     if not save_user_states():
                         user_states[user_uuid] = user_state
@@ -747,13 +809,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         f"Original squads already restored for {username}: "
                         f"{squads_to_restore}"
                     )
-                elif not should_restore_original_squads(user_state, subscription_profile):
-                    log(
-                        f"User {username} has no real subscription change yet; "
-                        f"keeping backup squad until a real subscription change is detected"
-                    )
-                    self._send_text(200, "Ignored")
-                    return
                 else:
                     if not patch_user_squad(user_uuid, squads_to_restore):
                         self._send_text(502, "Failed to restore user squads")
