@@ -26,11 +26,7 @@ sudo mkdir -p /opt/remnawave-switch-squads && cd /opt/remnawave-switch-squads
 Скачиваем файлы из репозитория
 ```bash
 sudo wget -O .env https://raw.githubusercontent.com/byte-7up/byte7up/main/.env.example
-```
-```
 sudo wget -O docker-compose.yml https://raw.githubusercontent.com/byte-7up/byte7up/main/docker-compose.yml
-sudo wget -O webhook.py https://raw.githubusercontent.com/byte-7up/byte7up/main/webhook.py
-sudo wget -O Dockerfile https://raw.githubusercontent.com/byte-7up/byte7up/main/Dockerfile
 ```
 
 Заполняем переменные
@@ -53,7 +49,7 @@ PORT=3000
 
 🐳 Запуск
 ```bash
-docker compose up -d --build && docker compose logs -f -t
+docker compose up -d && docker compose logs -f -t
 ```
 
 Контейнер запустит Python‑вебхук сервер, который будет обрабатывать события от Remnawave.
@@ -68,11 +64,6 @@ https://your-domain/api/v1/remnawave
 ```
 
 Если стоит reverse proxy (nginx/traefik), проксируйте путь `/api/v1/` на сервис с портом `3000`.
-
-Обновление:
-```bash
-cd /opt/remnawave-switch-squads && docker compose up -d --build && docker compose logs -f
-```
 
 Обновление:
 ```

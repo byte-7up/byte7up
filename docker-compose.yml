@@ -1,8 +1,6 @@
 services:
   remnawave-switch-squads:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: docker.io/byte7up/remnawave-switch-squads:latest
     container_name: remnawave-switch-squads
     restart: unless-stopped
     environment:
