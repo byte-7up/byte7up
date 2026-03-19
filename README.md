@@ -57,6 +57,10 @@ https://your-domain/api/v1/remnawave
 ```
 Если стоит reverse proxy (nginx/traefik), проксируйте путь /api/v1/ на сервис с портом 3000.
 
+Обновление:
+```
+cd /opt/remnawave-switch-squads && docker compose pull && docker compose down && docker compose up -d && docker compose logs -f
+```
 📌 Что делает сервис
 Когда пользователь получает статус:
 
