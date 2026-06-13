@@ -125,6 +125,25 @@ SUBSCRIPTION_PROFILE_ALIASES = {
     ),
 }
 
+SENSITIVE_LOG_KEYS = {
+    "trojanPassword",
+    "trojan_password",
+    "ssPassword",
+    "ss_password",
+    "vlessUuid",
+    "vless_uuid",
+    "subscriptionUrl",
+    "subscription_url",
+    "shortUuid",
+    "short_uuid",
+    "password",
+    "token",
+    "accessToken",
+    "access_token",
+    "refreshToken",
+    "refresh_token",
+}
+
 
 def log(message):
     print(message, flush=True)
@@ -143,6 +162,28 @@ def preview_json(data):
         return json.dumps(data, ensure_ascii=False, default=str)
     except TypeError:
         return repr(data)
+
+
+def redact_log_value(value):
+    if isinstance(value, dict):
+        return {
+            key: "***REDACTED***" if key in SENSITIVE_LOG_KEYS else redact_log_value(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [redact_log_value(item) for item in value]
+
+    return value
+
+
+def preview_response_body(body):
+    try:
+        payload = json.loads(body)
+    except (TypeError, json.JSONDecodeError):
+        return body[:1000]
+
+    return preview_json(redact_log_value(payload))
 
 
 def normalize_signature(value):
@@ -710,14 +751,14 @@ def patch_user(user_uuid, payload_variants, response_validator=None):
 
                     log(
                         f"PATCH {url} with {preview_json(request_payload)}, "
-                        f"status={resp.status}, body={body}"
+                        f"status={resp.status}, body={preview_response_body(body)}"
                     )
                     return True
             except error.HTTPError as exc:
                 body = exc.read().decode("utf-8", "replace")
                 log(
                     f"HTTP error patching via {url} with {preview_json(request_payload)}: "
-                    f"status={exc.code}, body={body}"
+                    f"status={exc.code}, body={preview_response_body(body)}"
                 )
             except Exception as exc:
                 log(
