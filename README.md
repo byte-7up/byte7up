@@ -4,6 +4,7 @@
 он автоматически:
 
 - Переключает пользователя на резервный squad при статусах **EXPIRED**, **LIMITED**  
+- Поддерживает несколько резервных internal squads и опциональный external squad
 - Временно переводит пользователя в **ACTIVE** на несколько дней 
 - Временно даёт ограничение трафика
 - Возвращает оригинальный squad после покупки / продления / изменения подписки
@@ -40,10 +41,15 @@ sudo nano .env
 ```env
 RW_API_URL=https://panel.example.com/api
 RW_API_TOKEN=ВАШ_API_TOKEN
+WEBHOOK_SECRET_HEADER=aabbccddeeff00112233445566778899
 BACKUP_SQUAD_UUID=uuid_резервного_squad
+# можно несколько: BACKUP_SQUAD_UUID=uuid1,uuid2
+BACKUP_EXTERNAL_SQUAD_UUID=
 TEMP_ACTIVE_DAYS=3
 TEMP_ACTIVE_TRAFFIC_LIMIT_MB=300
 WEBHOOK_PATH=/api/v1/remnawave
+WEBHOOK_MAX_AGE_SECONDS=300
+MAX_WEBHOOK_BODY_BYTES=1048576
 PORT=3000
 ```
 
@@ -62,6 +68,10 @@ Webhook URL:
 ```text
 https://your-domain/api/v1/remnawave
 ```
+
+`WEBHOOK_SECRET_HEADER` в `.env` этого сервиса должен совпадать с `WEBHOOK_SECRET_HEADER`
+из `.env` панели Remnawave. Без корректной подписи `X-Remnawave-Signature` сервис
+вернёт `401 Unauthorized` и не будет менять пользователя.
 
 Если стоит reverse proxy (nginx/traefik), проксируйте путь `/api/v1/` на сервис с портом `3000`.
 

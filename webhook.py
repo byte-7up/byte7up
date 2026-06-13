@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -21,6 +23,33 @@ def getenv_int(name, default):
         return default
 
 
+def getenv_first(*names, default=""):
+    for name in names:
+        value = os.getenv(name)
+        if value not in (None, ""):
+            return value.strip()
+
+    return default
+
+
+def parse_csv_value(value):
+    if value in (None, ""):
+        return []
+
+    return [
+        item.strip()
+        for item in str(value).split(",")
+        if item.strip()
+    ]
+
+
+def getenv_csv(name, default=""):
+    return parse_csv_value(os.getenv(name, default))
+
+
+UNSET = object()
+
+
 STATUSES_TO_BACKUP = {"EXPIRED", "LIMITED"}
 EVENTS_TO_BACKUP = {
     "user.expired": "EXPIRED",
@@ -33,10 +62,14 @@ SUPPORTED_USER_EVENTS = set(EVENTS_TO_BACKUP) | set(EVENTS_TO_RESTORE) | {
     "user.modified",
 }
 
-PORT = int(os.getenv("PORT", "3000"))
+PORT = getenv_int("PORT", 3000)
 API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api").rstrip("/")
 API_TOKEN = os.getenv("RW_API_TOKEN", "YOUR_API_TOKEN")
-BACKUP_SQUAD_UUID = os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid")
+BACKUP_SQUAD_UUIDS = (
+    getenv_csv("BACKUP_SQUAD_UUIDS")
+    or getenv_csv("BACKUP_SQUAD_UUID")
+)
+BACKUP_EXTERNAL_SQUAD_UUID = getenv_first("BACKUP_EXTERNAL_SQUAD_UUID", default="")
 TEMP_ACTIVE_DAYS = getenv_int("TEMP_ACTIVE_DAYS", 3)
 TEMP_ACTIVE_TRAFFIC_LIMIT_MB = max(0, getenv_int("TEMP_ACTIVE_TRAFFIC_LIMIT_MB", 300))
 TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES = (
@@ -48,6 +81,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_FILE = os.path.join(BASE_DIR, "data", "original_squads.json")
 DATA_FILE = os.getenv("DATA_PATH", DEFAULT_DATA_FILE)
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/api/v1/remnawave")
+WEBHOOK_SECRET = getenv_first(
+    "WEBHOOK_SECRET_HEADER",
+    "REMNAWAVE_WEBHOOK_SECRET",
+    "WEBHOOK_SECRET",
+    default="",
+)
+WEBHOOK_SIGNATURE_HEADER = getenv_first(
+    "WEBHOOK_SIGNATURE_HEADER",
+    default="X-Remnawave-Signature",
+)
+WEBHOOK_TIMESTAMP_HEADER = getenv_first(
+    "WEBHOOK_TIMESTAMP_HEADER",
+    default="X-Remnawave-Timestamp",
+)
+WEBHOOK_MAX_AGE_SECONDS = max(0, getenv_int("WEBHOOK_MAX_AGE_SECONDS", 300))
+MAX_WEBHOOK_BODY_BYTES = max(0, getenv_int("MAX_WEBHOOK_BODY_BYTES", 1024 * 1024))
 
 SUBSCRIPTION_PROFILE_ALIASES = {
     "expire_at": (
@@ -94,6 +143,52 @@ def preview_json(data):
         return json.dumps(data, ensure_ascii=False, default=str)
     except TypeError:
         return repr(data)
+
+
+def normalize_signature(value):
+    if not isinstance(value, str):
+        return ""
+
+    signature = value.strip()
+    if signature.lower().startswith("sha256="):
+        signature = signature.split("=", 1)[1].strip()
+
+    return signature.lower()
+
+
+def validate_webhook_signature(headers, body):
+    if not WEBHOOK_SECRET:
+        return False, "WEBHOOK_SECRET_HEADER is not configured"
+
+    received_signature = normalize_signature(headers.get(WEBHOOK_SIGNATURE_HEADER))
+    if not received_signature:
+        return False, f"missing {WEBHOOK_SIGNATURE_HEADER} header"
+
+    if len(received_signature) != 64 or any(
+        char not in "0123456789abcdef"
+        for char in received_signature
+    ):
+        return False, "invalid webhook signature format"
+
+    expected_signature = hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(received_signature, expected_signature):
+        return False, "invalid webhook signature"
+
+    if WEBHOOK_MAX_AGE_SECONDS > 0:
+        timestamp = parse_datetime_value(headers.get(WEBHOOK_TIMESTAMP_HEADER))
+        if timestamp is None:
+            return False, f"missing or invalid {WEBHOOK_TIMESTAMP_HEADER} header"
+
+        age_seconds = abs((datetime.now(timezone.utc) - timestamp).total_seconds())
+        if age_seconds > WEBHOOK_MAX_AGE_SECONDS:
+            return False, "webhook timestamp is outside allowed age"
+
+    return True, ""
 
 
 def parse_datetime_value(value):
@@ -257,6 +352,34 @@ def extract_squad_uuids(user):
     return []
 
 
+def normalize_external_squad_uuid(value):
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+
+    if isinstance(value, dict):
+        return normalize_external_squad_uuid(value.get("uuid"))
+
+    return None
+
+
+def extract_external_squad_uuid(user):
+    candidate_keys = (
+        "externalSquadUuid",
+        "external_squad_uuid",
+        "externalSquad",
+        "external_squad",
+    )
+
+    for key in candidate_keys:
+        if key not in user:
+            continue
+
+        return normalize_external_squad_uuid(user.get(key))
+
+    return None
+
+
 def extract_expire_at(user):
     candidate_keys = (
         "expireAt",
@@ -367,10 +490,35 @@ def squads_match(current_squads, target_squads):
     return normalize_squad_uuids(current_squads) == normalize_squad_uuids(target_squads)
 
 
-def build_user_state(original_squads, status="", expire_at=None):
+def external_squads_match(current_squad, target_squad):
+    return normalize_external_squad_uuid(current_squad) == normalize_external_squad_uuid(
+        target_squad
+    )
+
+
+def target_squads_match(
+    current_squads,
+    target_squads,
+    current_external_squad,
+    target_external_squad=UNSET,
+):
+    internal_matches = not target_squads or squads_match(current_squads, target_squads)
+    external_matches = (
+        target_external_squad is UNSET
+        or external_squads_match(current_external_squad, target_external_squad)
+    )
+    return internal_matches and external_matches
+
+
+def build_user_state(original_squads, status="", expire_at=None, external_squad=UNSET):
     user_state = {
         "original_squads": normalize_squad_uuids(original_squads),
     }
+
+    if external_squad is not UNSET:
+        user_state["original_external_squad"] = normalize_external_squad_uuid(
+            external_squad
+        )
 
     if status:
         user_state["original_status"] = status
@@ -401,10 +549,22 @@ def normalize_user_state(user_uuid, raw_state):
             original_squads = raw_state.get(key)
             break
 
+    original_external_squad = UNSET
+    for key in (
+        "original_external_squad",
+        "originalExternalSquad",
+        "external_squad",
+        "externalSquad",
+    ):
+        if key in raw_state:
+            original_external_squad = raw_state.get(key)
+            break
+
     user_state = build_user_state(
         original_squads,
         status=raw_state.get("original_status", ""),
         expire_at=parse_datetime_value(raw_state.get("original_expire_at")),
+        external_squad=original_external_squad,
     )
 
     temporary_active_until = parse_datetime_value(
@@ -568,11 +728,64 @@ def patch_user(user_uuid, payload_variants, response_validator=None):
     return False
 
 
-def patch_user_squad(user_uuid, squads):
-    payload_variants = (
-        {"activeInternalSquads": squads},
-    )
-    return patch_user(user_uuid, payload_variants)
+def patch_user_squad(user_uuid, squads=UNSET, external_squad=UNSET):
+    payload = {}
+
+    if squads is not UNSET:
+        payload["activeInternalSquads"] = normalize_squad_uuids(squads)
+
+    if external_squad is not UNSET:
+        payload["externalSquadUuid"] = normalize_external_squad_uuid(external_squad)
+
+    if not payload:
+        return True
+
+    payload_variants = (payload,)
+
+    def response_validator(request_payload, response_user):
+        if not isinstance(response_user, dict):
+            return True
+
+        if "activeInternalSquads" in request_payload:
+            response_has_internal_squads = any(
+                key in response_user
+                for key in (
+                    "activeInternalSquads",
+                    "active_internal_squads",
+                    "internalSquads",
+                    "internal_squads",
+                    "internalSquadUuids",
+                    "internal_squad_uuids",
+                    "squadUuids",
+                    "squad_uuids",
+                    "squads",
+                )
+            )
+            if response_has_internal_squads and not squads_match(
+                extract_squad_uuids(response_user),
+                request_payload["activeInternalSquads"],
+            ):
+                return False
+
+        if "externalSquadUuid" in request_payload:
+            response_has_external_squad = any(
+                key in response_user
+                for key in (
+                    "externalSquadUuid",
+                    "external_squad_uuid",
+                    "externalSquad",
+                    "external_squad",
+                )
+            )
+            if response_has_external_squad and not external_squads_match(
+                extract_external_squad_uuid(response_user),
+                request_payload["externalSquadUuid"],
+            ):
+                return False
+
+        return True
+
+    return patch_user(user_uuid, payload_variants, response_validator=response_validator)
 
 
 def patch_user_access(user_uuid, expire_at, traffic_limit_bytes=None, traffic_limit_strategy=""):
@@ -747,8 +960,31 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_text(404, "Not Found")
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            log("Webhook request has invalid Content-Length")
+            self._send_text(400, "Invalid Content-Length")
+            return
+
+        if MAX_WEBHOOK_BODY_BYTES and content_length > MAX_WEBHOOK_BODY_BYTES:
+            log(
+                f"Webhook request body too large: {content_length} bytes, "
+                f"limit={MAX_WEBHOOK_BODY_BYTES}"
+            )
+            self._send_text(413, "Payload Too Large")
+            return
+
         body = self.rfile.read(content_length)
+
+        is_valid_webhook, validation_error = validate_webhook_signature(
+            self.headers,
+            body,
+        )
+        if not is_valid_webhook:
+            log(f"Webhook authentication failed: {validation_error}")
+            self._send_text(401, "Unauthorized")
+            return
 
         try:
             payload = json.loads(body)
@@ -784,6 +1020,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         username = user.get("username") or user.get("email") or user_uuid
         status = infer_status(event, user)
         squad_uuids = extract_squad_uuids(user)
+        external_squad_uuid = extract_external_squad_uuid(user)
         expire_at = extract_expire_at(user)
         subscription_profile = extract_subscription_profile(user)
         used_traffic_bytes = extract_used_traffic_bytes(user)
@@ -796,7 +1033,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         log(
             f"Webhook received: event={event or 'unknown'}, "
             f"user={username}, status={status or 'unknown'}, "
-            f"squads={squad_uuids}, expireAt={format_datetime_value(expire_at) if expire_at else 'unknown'}, "
+            f"squads={squad_uuids}, externalSquad={external_squad_uuid or 'none'}, "
+            f"expireAt={format_datetime_value(expire_at) if expire_at else 'unknown'}, "
             f"subscriptionProfile={preview_json(subscription_profile)}"
         )
 
@@ -806,11 +1044,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
         )
 
         if should_handle_backup:
-            target_squads = [BACKUP_SQUAD_UUID]
-            user_state = user_states.get(user_uuid)
-            already_on_backup = squads_match(squad_uuids, target_squads)
+            target_squads = normalize_squad_uuids(BACKUP_SQUAD_UUIDS)
+            target_external_squad = (
+                normalize_external_squad_uuid(BACKUP_EXTERNAL_SQUAD_UUID)
+                if BACKUP_EXTERNAL_SQUAD_UUID
+                else UNSET
+            )
 
-            if not squad_uuids:
+            if not target_squads and target_external_squad is UNSET:
+                log("No backup internal or external squad is configured, skipping backup")
+                self._send_text(500, "Backup squad is not configured")
+                return
+
+            user_state = user_states.get(user_uuid)
+            already_on_backup = target_squads_match(
+                squad_uuids,
+                target_squads,
+                external_squad_uuid,
+                target_external_squad,
+            )
+
+            if target_squads and not squad_uuids and user_state is None:
                 log(f"User {username} has no squads in payload, skipping backup")
                 self._send_text(200, "Ignored")
                 return
@@ -824,7 +1078,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     self._send_text(200, "Ignored")
                     return
 
-                user_state = build_user_state(squad_uuids, status=status, expire_at=expire_at)
+                user_state = build_user_state(
+                    squad_uuids,
+                    status=status,
+                    expire_at=expire_at,
+                    external_squad=(
+                        external_squad_uuid
+                        if target_external_squad is not UNSET
+                        else UNSET
+                    ),
+                )
                 if subscription_profile:
                     user_state["original_subscription_profile"] = dict(subscription_profile)
                 user_states[user_uuid] = user_state
@@ -839,6 +1102,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
                 if not user_state.get("original_squads") and not already_on_backup:
                     user_state["original_squads"] = list(normalize_squad_uuids(squad_uuids))
+                    state_changed = True
+
+                if (
+                    target_external_squad is not UNSET
+                    and "original_external_squad" not in user_state
+                    and not already_on_backup
+                ):
+                    user_state["original_external_squad"] = normalize_external_squad_uuid(
+                        external_squad_uuid
+                    )
                     state_changed = True
 
                 if status and not user_state.get("original_status"):
@@ -915,12 +1188,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
             if already_on_backup:
                 log(
-                    f"User {username} already has target squads {target_squads}, "
+                    f"User {username} already has target squads {target_squads} "
+                    f"and external squad "
+                    f"{target_external_squad if target_external_squad is not UNSET else 'unchanged'}, "
                     f"skipping squad patch"
                 )
-            elif not patch_user_squad(user_uuid, target_squads):
+            elif not patch_user_squad(
+                user_uuid,
+                target_squads if target_squads else UNSET,
+                target_external_squad,
+            ):
                 log(
-                    f"Failed to switch {username} to backup squads {target_squads}; "
+                    f"Failed to switch {username} to backup squads {target_squads} "
+                    f"and external squad "
+                    f"{target_external_squad if target_external_squad is not UNSET else 'unchanged'}; "
                     f"acknowledging webhook to avoid retry loop"
                 )
                 self._send_text(200, "Failed to patch user")
@@ -948,8 +1229,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 log(f"No saved squads for {username}, nothing to restore")
             else:
                 squads_to_restore = user_state.get("original_squads") or []
-                if not squads_to_restore:
-                    log(f"Saved state for {username} has no original squads, nothing to restore")
+                external_to_restore = (
+                    user_state.get("original_external_squad")
+                    if (
+                        BACKUP_EXTERNAL_SQUAD_UUID
+                        and "original_external_squad" in user_state
+                    )
+                    else UNSET
+                )
+
+                if not squads_to_restore and external_to_restore is UNSET:
+                    log(
+                        f"Saved state for {username} has no original squads, "
+                        f"nothing to restore"
+                    )
                     self._send_text(200, "Ignored")
                     return
 
@@ -969,8 +1262,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     user_state,
                     subscription_profile,
                 )
+                already_restored = (
+                    (not squads_to_restore or squads_match(squad_uuids, squads_to_restore))
+                    and (
+                        external_to_restore is UNSET
+                        or external_squads_match(external_squad_uuid, external_to_restore)
+                    )
+                )
 
-                if squads_match(squad_uuids, squads_to_restore):
+                if already_restored:
                     if restore_access_settings and not patch_user_traffic_settings(
                         user_uuid,
                         traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
@@ -994,13 +1294,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
                     log(
                         f"Original squads already restored for {username}: "
-                        f"{squads_to_restore}"
+                        f"{squads_to_restore}, external squad="
+                        f"{external_to_restore if external_to_restore is not UNSET else 'unchanged'}"
                     )
                 else:
-                    if not patch_user_squad(user_uuid, squads_to_restore):
+                    if not patch_user_squad(
+                        user_uuid,
+                        squads_to_restore if squads_to_restore else UNSET,
+                        external_to_restore,
+                    ):
                         log(
                             f"Failed to restore original squads for {username}: "
-                            f"{squads_to_restore}; acknowledging webhook to avoid retry loop"
+                            f"{squads_to_restore}, external squad="
+                            f"{external_to_restore if external_to_restore is not UNSET else 'unchanged'}; "
+                            f"acknowledging webhook to avoid retry loop"
                         )
                         self._send_text(200, "Failed to restore user squads")
                         return
@@ -1026,7 +1333,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         self._send_text(500, "Failed to update local state")
                         return
 
-                    log(f"Restored original squads for {username}: {squads_to_restore}")
+                    log(
+                        f"Restored original squads for {username}: {squads_to_restore}, "
+                        f"external squad="
+                        f"{external_to_restore if external_to_restore is not UNSET else 'unchanged'}"
+                    )
 
         self._send_text(200, "OK")
 
@@ -1036,7 +1347,10 @@ def run():
     log(
         f"Webhook server running on port {PORT}, path {normalize_path(WEBHOOK_PATH)}, "
         f"api_url={API_URL}, temp_active_days={TEMP_ACTIVE_DAYS}, "
-        f"temp_active_traffic_limit_mb={TEMP_ACTIVE_TRAFFIC_LIMIT_MB}"
+        f"temp_active_traffic_limit_mb={TEMP_ACTIVE_TRAFFIC_LIMIT_MB}, "
+        f"backup_squads={BACKUP_SQUAD_UUIDS}, "
+        f"backup_external_squad={BACKUP_EXTERNAL_SQUAD_UUID or 'disabled'}, "
+        f"webhook_auth={'enabled' if WEBHOOK_SECRET else 'missing-secret'}"
     )
     server.serve_forever()
 
