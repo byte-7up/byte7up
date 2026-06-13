@@ -1083,15 +1083,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
             event in EVENTS_TO_BACKUP
             or (not event and status in STATUSES_TO_BACKUP)
         )
+        target_squads = normalize_squad_uuids(BACKUP_SQUAD_UUIDS)
+        target_external_squad = (
+            normalize_external_squad_uuid(BACKUP_EXTERNAL_SQUAD_UUID)
+            if BACKUP_EXTERNAL_SQUAD_UUID
+            else UNSET
+        )
 
         if should_handle_backup:
-            target_squads = normalize_squad_uuids(BACKUP_SQUAD_UUIDS)
-            target_external_squad = (
-                normalize_external_squad_uuid(BACKUP_EXTERNAL_SQUAD_UUID)
-                if BACKUP_EXTERNAL_SQUAD_UUID
-                else UNSET
-            )
-
             if not target_squads and target_external_squad is UNSET:
                 log("No backup internal or external squad is configured, skipping backup")
                 self._send_text(500, "Backup squad is not configured")
@@ -1303,21 +1302,100 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     user_state,
                     subscription_profile,
                 )
+                internal_backup_managed = bool(target_squads)
+                external_backup_managed = target_external_squad is not UNSET
+                internal_squads_are_original = (
+                    not internal_backup_managed
+                    or not squads_to_restore
+                    or squads_match(squad_uuids, squads_to_restore)
+                )
+                external_squad_is_original = (
+                    not external_backup_managed
+                    or external_to_restore is UNSET
+                    or external_squads_match(external_squad_uuid, external_to_restore)
+                )
+                internal_squads_are_backup = (
+                    not internal_backup_managed
+                    or squads_match(squad_uuids, target_squads)
+                )
+                external_squad_is_backup = (
+                    not external_backup_managed
+                    or external_squads_match(external_squad_uuid, target_external_squad)
+                )
+                internal_squads_are_remnashop_assigned = (
+                    internal_backup_managed
+                    and bool(squad_uuids)
+                    and not internal_squads_are_original
+                    and not internal_squads_are_backup
+                )
+                external_squad_is_remnashop_assigned = (
+                    external_backup_managed
+                    and external_squad_uuid is not None
+                    and not external_squad_is_original
+                    and not external_squad_is_backup
+                )
                 already_restored = (
-                    (not squads_to_restore or squads_match(squad_uuids, squads_to_restore))
-                    and (
-                        external_to_restore is UNSET
-                        or external_squads_match(external_squad_uuid, external_to_restore)
+                    internal_squads_are_original
+                    and external_squad_is_original
+                )
+                remnashop_assigned_new_squads = (
+                    internal_squads_are_remnashop_assigned
+                    or external_squad_is_remnashop_assigned
+                )
+                squads_patch = (
+                    squads_to_restore
+                    if (
+                        internal_backup_managed
+                        and squads_to_restore
+                        and not internal_squads_are_original
+                        and not internal_squads_are_remnashop_assigned
                     )
+                    else UNSET
+                )
+                external_patch = (
+                    external_to_restore
+                    if (
+                        external_backup_managed
+                        and external_to_restore is not UNSET
+                        and not external_squad_is_original
+                        and not external_squad_is_remnashop_assigned
+                    )
+                    else UNSET
                 )
 
+                if (
+                    remnashop_assigned_new_squads
+                    and squads_patch is UNSET
+                    and external_patch is UNSET
+                ):
+                    user_states.pop(user_uuid, None)
+                    if not save_user_states():
+                        user_states[user_uuid] = user_state
+                        self._send_text(500, "Failed to update local state")
+                        return
+
+                    log(
+                        f"Detected Remnashop-assigned squads for {username}: "
+                        f"current_squads={squad_uuids}, "
+                        f"current_external_squad={external_squad_uuid or 'none'}; "
+                        f"leaving them unchanged and clearing saved backup state"
+                    )
+                    self._send_text(200, "OK")
+                    return
+
                 if already_restored:
-                    if restore_access_settings and not patch_user_traffic_settings(
-                        user_uuid,
-                        traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
-                        traffic_limit_strategy=restore_access_settings.get(
-                            "traffic_limit_strategy", ""
-                        ),
+                    if (
+                        restore_access_settings
+                        and not remnashop_assigned_new_squads
+                        and not patch_user_traffic_settings(
+                            user_uuid,
+                            traffic_limit_bytes=restore_access_settings.get(
+                                "traffic_limit_bytes"
+                            ),
+                            traffic_limit_strategy=restore_access_settings.get(
+                                "traffic_limit_strategy", ""
+                            ),
+                        )
                     ):
                         log(
                             f"Failed to restore original access settings for {username}: "
@@ -1341,24 +1419,31 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 else:
                     if not patch_user_squad(
                         user_uuid,
-                        squads_to_restore if squads_to_restore else UNSET,
-                        external_to_restore,
+                        squads_patch,
+                        external_patch,
                     ):
                         log(
-                            f"Failed to restore original squads for {username}: "
-                            f"{squads_to_restore}, external squad="
-                            f"{external_to_restore if external_to_restore is not UNSET else 'unchanged'}; "
+                            f"Failed to restore backup-managed squads for {username}: "
+                            f"squads={squads_patch if squads_patch is not UNSET else 'unchanged'}, "
+                            f"external squad="
+                            f"{external_patch if external_patch is not UNSET else 'unchanged'}; "
                             f"acknowledging webhook to avoid retry loop"
                         )
                         self._send_text(200, "Failed to restore user squads")
                         return
 
-                    if restore_access_settings and not patch_user_traffic_settings(
-                        user_uuid,
-                        traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
-                        traffic_limit_strategy=restore_access_settings.get(
-                            "traffic_limit_strategy", ""
-                        ),
+                    if (
+                        restore_access_settings
+                        and not remnashop_assigned_new_squads
+                        and not patch_user_traffic_settings(
+                            user_uuid,
+                            traffic_limit_bytes=restore_access_settings.get(
+                                "traffic_limit_bytes"
+                            ),
+                            traffic_limit_strategy=restore_access_settings.get(
+                                "traffic_limit_strategy", ""
+                            ),
+                        )
                     ):
                         log(
                             f"Failed to restore original access settings for {username}: "
@@ -1374,11 +1459,22 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         self._send_text(500, "Failed to update local state")
                         return
 
-                    log(
-                        f"Restored original squads for {username}: {squads_to_restore}, "
-                        f"external squad="
-                        f"{external_to_restore if external_to_restore is not UNSET else 'unchanged'}"
-                    )
+                    if remnashop_assigned_new_squads:
+                        log(
+                            f"Preserved Remnashop-assigned squads for {username}: "
+                            f"current_squads={squad_uuids}, "
+                            f"current_external_squad={external_squad_uuid or 'none'}; "
+                            f"restored backup-managed parts: "
+                            f"squads={squads_patch if squads_patch is not UNSET else 'unchanged'}, "
+                            f"external squad="
+                            f"{external_patch if external_patch is not UNSET else 'unchanged'}"
+                        )
+                    else:
+                        log(
+                            f"Restored original squads for {username}: {squads_to_restore}, "
+                            f"external squad="
+                            f"{external_to_restore if external_to_restore is not UNSET else 'unchanged'}"
+                        )
 
         self._send_text(200, "OK")
 
@@ -1391,7 +1487,8 @@ def run():
         f"temp_active_traffic_limit_mb={TEMP_ACTIVE_TRAFFIC_LIMIT_MB}, "
         f"backup_squads={BACKUP_SQUAD_UUIDS}, "
         f"backup_external_squad={BACKUP_EXTERNAL_SQUAD_UUID or 'disabled'}, "
-        f"webhook_auth={'enabled' if WEBHOOK_SECRET else 'missing-secret'}"
+        f"webhook_auth={'enabled' if WEBHOOK_SECRET else 'missing-secret'}, "
+        "remnashop_squad_policy=preserve-assigned-squads"
     )
     server.serve_forever()
 
