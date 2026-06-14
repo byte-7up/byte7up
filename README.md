@@ -50,8 +50,38 @@ TEMP_ACTIVE_TRAFFIC_LIMIT_MB=300
 WEBHOOK_PATH=/api/v1/remnawave
 WEBHOOK_MAX_AGE_SECONDS=300
 MAX_WEBHOOK_BODY_BYTES=1048576
-PORT=3000
+PORT=3040
+
+# Опционально, если API панели закрыт reverse proxy защитой.
+# RW_API_CADDY_TOKEN=значение_X-Api-Key
+# RW_API_COOKIE=name=value
+# RW_API_CF_CLIENT_ID=cloudflare_access_client_id
+# RW_API_CF_CLIENT_SECRET=cloudflare_access_client_secret
+# RW_API_INTERNAL_PROXY_HEADERS=auto
 ```
+
+Если сервис стоит рядом с Remnawave в одной Docker-сети, лучше ходить в API панели
+напрямую, без внешнего защищённого домена:
+
+```env
+RW_API_URL=http://remnawave:3000/api
+```
+
+Для такого локального URL сервис автоматически добавляет `x-forwarded-proto: https`
+и `x-forwarded-for: 127.0.0.1`, чтобы пройти HTTPS/proxy проверку самой панели.
+
+`RW_API_INTERNAL_PROXY_HEADERS=auto` обычно оставляют как есть. В режиме `auto`
+эти два заголовка добавляются только для локальных HTTP-адресов панели:
+`http://remnawave:3000/api`, `localhost`, `127.0.0.1`. Для внешнего
+`https://panel.example.com/api` они не добавляются. Принудительно выключить можно
+значением `false`, включить для любого URL — `true`.
+
+Если `RW_API_URL` указывает на внешний домен панели, закрытый защитой reverse proxy,
+раскомментируйте нужные опциональные переменные:
+
+- `RW_API_CADDY_TOKEN` — отправляется как `X-Api-Key`, нужен для protected API в Caddy setup: https://docs.rw/docs/security/caddy-with-minimal-setup/
+- `RW_API_COOKIE` — отправляется как `Cookie: name=value`, подходит для cookie-gate reverse proxy вроде `eGamesAPI/remnawave-reverse-proxy`
+- `RW_API_CF_CLIENT_ID` и `RW_API_CF_CLIENT_SECRET` — отправляются как `CF-Access-Client-Id` и `CF-Access-Client-Secret` для Cloudflare Access
 
 🐳 Запуск
 ```bash
@@ -73,7 +103,7 @@ https://your-domain/api/v1/remnawave
 из `.env` панели Remnawave. Без корректной подписи `X-Remnawave-Signature` сервис
 вернёт `401 Unauthorized` и не будет менять пользователя.
 
-Если стоит reverse proxy (nginx/traefik), проксируйте путь `/api/v1/` на сервис с портом `3000`.
+Если стоит reverse proxy (nginx/traefik), проксируйте путь `/api/v1/` на сервис с портом `3040`.
 
 Обновление:
 ```

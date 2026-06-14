@@ -6,6 +6,11 @@ services:
     environment:
       - RW_API_URL=${RW_API_URL}
       - RW_API_TOKEN=${RW_API_TOKEN}
+      - RW_API_CADDY_TOKEN=${RW_API_CADDY_TOKEN:-}
+      - RW_API_COOKIE=${RW_API_COOKIE:-}
+      - RW_API_CF_CLIENT_ID=${RW_API_CF_CLIENT_ID:-}
+      - RW_API_CF_CLIENT_SECRET=${RW_API_CF_CLIENT_SECRET:-}
+      - RW_API_INTERNAL_PROXY_HEADERS=${RW_API_INTERNAL_PROXY_HEADERS:-auto}
       - WEBHOOK_SECRET_HEADER=${WEBHOOK_SECRET_HEADER}
       - BACKUP_SQUAD_UUID=${BACKUP_SQUAD_UUID:-}
       - BACKUP_SQUAD_UUIDS=${BACKUP_SQUAD_UUIDS:-}
@@ -15,12 +20,12 @@ services:
       - WEBHOOK_PATH=${WEBHOOK_PATH}
       - WEBHOOK_MAX_AGE_SECONDS=${WEBHOOK_MAX_AGE_SECONDS:-300}
       - MAX_WEBHOOK_BODY_BYTES=${MAX_WEBHOOK_BODY_BYTES:-1048576}
-      - PORT=${PORT}
+      - PORT=${PORT:-3040}
       - DATA_PATH=/data/original_squads.json
     volumes:
       - remnawave-switch-squads-data:/data
     ports:
-      - "${BIND_HOST:-127.0.0.1}:${HOST_PORT:-3002}:${PORT:-3000}"
+      - "${BIND_HOST:-127.0.0.1}:${HOST_PORT:-3040}:${PORT:-3040}"
     networks:
       - remnawave-network
 

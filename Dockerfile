@@ -4,9 +4,9 @@ WORKDIR /app
 COPY webhook.py /app/
 RUN mkdir -p /data
 
-ENV PORT=3000
+ENV PORT=3040
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 3000
+EXPOSE 3040
 
 CMD ["python", "webhook.py"]

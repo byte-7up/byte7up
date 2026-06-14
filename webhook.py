@@ -23,6 +23,23 @@ def getenv_int(name, default):
         return default
 
 
+def getenv_bool_mode(name, default="auto"):
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return "enabled"
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return "disabled"
+    if normalized == "auto":
+        return "auto"
+
+    print(f"Invalid boolean mode for {name}: {value!r}, using {default}", flush=True)
+    return default
+
+
 def getenv_first(*names, default=""):
     for name in names:
         value = os.getenv(name)
@@ -62,9 +79,29 @@ SUPPORTED_USER_EVENTS = set(EVENTS_TO_BACKUP) | set(EVENTS_TO_RESTORE) | {
     "user.modified",
 }
 
-PORT = getenv_int("PORT", 3000)
+PORT = getenv_int("PORT", 3040)
 API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api").rstrip("/")
 API_TOKEN = os.getenv("RW_API_TOKEN", "YOUR_API_TOKEN")
+API_CADDY_TOKEN = getenv_first(
+    "RW_API_CADDY_TOKEN",
+    default="",
+)
+API_COOKIE = getenv_first(
+    "RW_API_COOKIE",
+    default="",
+)
+API_CF_CLIENT_ID = getenv_first(
+    "RW_API_CF_CLIENT_ID",
+    default="",
+)
+API_CF_CLIENT_SECRET = getenv_first(
+    "RW_API_CF_CLIENT_SECRET",
+    default="",
+)
+API_INTERNAL_PROXY_HEADERS_MODE = getenv_bool_mode(
+    "RW_API_INTERNAL_PROXY_HEADERS",
+    default="auto",
+)
 BACKUP_SQUAD_UUIDS = (
     getenv_csv("BACKUP_SQUAD_UUIDS")
     or getenv_csv("BACKUP_SQUAD_UUID")
@@ -345,6 +382,63 @@ def build_patch_urls(user_uuid):
             unique_urls.append(url)
 
     return unique_urls
+
+
+def build_api_headers():
+    headers = {
+        "Authorization": f"Bearer {API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    if API_CADDY_TOKEN:
+        headers["X-Api-Key"] = API_CADDY_TOKEN
+
+    if API_COOKIE:
+        headers["Cookie"] = API_COOKIE
+
+    if API_CF_CLIENT_ID:
+        headers["CF-Access-Client-Id"] = API_CF_CLIENT_ID
+
+    if API_CF_CLIENT_SECRET:
+        headers["CF-Access-Client-Secret"] = API_CF_CLIENT_SECRET
+
+    if should_add_internal_proxy_headers():
+        headers["x-forwarded-proto"] = "https"
+        headers["x-forwarded-for"] = "127.0.0.1"
+
+    return headers
+
+
+def should_add_internal_proxy_headers():
+    if API_INTERNAL_PROXY_HEADERS_MODE == "enabled":
+        return True
+
+    if API_INTERNAL_PROXY_HEADERS_MODE == "disabled":
+        return False
+
+    parsed_api_url = urlsplit(API_URL)
+    hostname = (parsed_api_url.hostname or "").lower()
+
+    return parsed_api_url.scheme == "http" and hostname in {
+        "remnawave",
+        "localhost",
+        "127.0.0.1",
+    }
+
+
+def describe_api_proxy_auth():
+    enabled = []
+
+    if API_CADDY_TOKEN:
+        enabled.append("x-api-key")
+    if API_COOKIE:
+        enabled.append("cookie")
+    if API_CF_CLIENT_ID or API_CF_CLIENT_SECRET:
+        enabled.append("cloudflare-access")
+    if should_add_internal_proxy_headers():
+        enabled.append("internal-proxy-headers")
+
+    return ",".join(enabled) if enabled else "disabled"
 
 
 def ensure_list(value):
@@ -728,10 +822,7 @@ def patch_user(user_uuid, payload_variants, response_validator=None):
                 url,
                 data=data,
                 method="PATCH",
-                headers={
-                    "Authorization": f"Bearer {API_TOKEN}",
-                    "Content-Type": "application/json",
-                },
+                headers=build_api_headers(),
             )
 
             try:
@@ -1488,6 +1579,7 @@ def run():
         f"backup_squads={BACKUP_SQUAD_UUIDS}, "
         f"backup_external_squad={BACKUP_EXTERNAL_SQUAD_UUID or 'disabled'}, "
         f"webhook_auth={'enabled' if WEBHOOK_SECRET else 'missing-secret'}, "
+        f"api_proxy_auth={describe_api_proxy_auth()}, "
         "remnashop_squad_policy=preserve-assigned-squads"
     )
     server.serve_forever()
