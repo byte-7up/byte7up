@@ -46,6 +46,9 @@ BACKUP_SQUAD_UUID=uuid_резервного_squad
 # можно несколько: BACKUP_SQUAD_UUID=uuid1,uuid2
 BACKUP_EXTERNAL_SQUAD_UUID=
 TEMP_ACTIVE_DAYS=3
+# TEMP_ACTIVE_TRAFFIC_LIMIT_MB задаёт минимальный запас трафика.
+# Фактический лимит округляется вверх до целого GiB, поэтому пользователь
+# может получить немного больше указанного значения.
 TEMP_ACTIVE_TRAFFIC_LIMIT_MB=300
 WEBHOOK_PATH=/api/v1/remnawave
 WEBHOOK_MAX_AGE_SECONDS=300
@@ -92,11 +95,22 @@ docker compose up -d && docker compose logs -f -t
 
 🔗 Настройка webhook в панели Remnawave
 
-В .env панели Remnawave:
+Для сервиса нужен отдельный публичный домен или поддомен, который будет принимать
+webhook от Remnawave, например `switch.example.com`. Направьте этот домен через
+reverse proxy на контейнер `remnawave-switch-squads`.
 
-Webhook URL:
-```text
-https://your-domain/api/v1/remnawave
+В `.env` панели Remnawave включите webhook и укажите полный URL этого сервиса:
+
+```env
+WEBHOOK_ENABLED=true
+WEBHOOK_URL=https://switch.example.com/api/v1/remnawave
+```
+
+Если в панели уже используется другой webhook, добавьте URL этого сервиса через
+запятую:
+
+```env
+WEBHOOK_URL=https://old-webhook.example/path,https://switch.example.com/api/v1/remnawave
 ```
 
 `WEBHOOK_SECRET_HEADER` в `.env` этого сервиса должен совпадать с `WEBHOOK_SECRET_HEADER`
@@ -115,6 +129,12 @@ cd /opt/remnawave-switch-squads && docker compose pull && docker compose down &&
 
 `EXPIRED / LIMITED`  
 Сохраняется original squad, пользователь переключается на резервный squad и временно переводится в `ACTIVE`
+
+Временный лимит считается как текущий использованный трафик + `TEMP_ACTIVE_TRAFFIC_LIMIT_MB`.
+После расчёта лимит округляется вверх до целого GiB, поэтому фактический остаток трафика
+может быть больше указанного значения. Например, при `TEMP_ACTIVE_TRAFFIC_LIMIT_MB=300`
+пользователь получит минимум 300 МБ дополнительного трафика, но из-за округления запас
+может быть больше.
 
 При покупке / продлении / изменении подписки  
 Оригинальный squad восстанавливается
