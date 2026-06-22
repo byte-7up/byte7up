@@ -74,6 +74,7 @@ EVENTS_TO_BACKUP = {
 }
 EVENTS_TO_RESTORE = {
     "user.enabled": "ACTIVE",
+    "user.traffic_reset": "ACTIVE",
 }
 SUPPORTED_USER_EVENTS = set(EVENTS_TO_BACKUP) | set(EVENTS_TO_RESTORE) | {
     "user.modified",
@@ -114,6 +115,7 @@ TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES = (
     if TEMP_ACTIVE_TRAFFIC_LIMIT_MB > 0
     else None
 )
+GIB_BYTES = 1024 * 1024 * 1024
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_FILE = os.path.join(BASE_DIR, "data", "original_squads.json")
 DATA_FILE = os.getenv("DATA_PATH", DEFAULT_DATA_FILE)
@@ -702,6 +704,12 @@ def normalize_user_state(user_uuid, raw_state):
         external_squad=original_external_squad,
     )
 
+    original_subscription_profile = raw_state.get("original_subscription_profile")
+    if isinstance(original_subscription_profile, dict):
+        user_state["original_subscription_profile"] = normalize_json_value(
+            original_subscription_profile
+        )
+
     temporary_active_until = parse_datetime_value(
         raw_state.get("temporary_active_until")
         or raw_state.get("temporaryActiveUntil")
@@ -709,15 +717,13 @@ def normalize_user_state(user_uuid, raw_state):
     )
     if temporary_active_until is not None:
         user_state["temporary_active_until"] = format_datetime_value(temporary_active_until)
-        user_state["temporary_subscription_profile"] = (
-            build_subscription_profile_from_expire_at(temporary_active_until)
+        temporary_subscription_profile = dict(
+            user_state.get("original_subscription_profile") or {}
         )
-
-    original_subscription_profile = raw_state.get("original_subscription_profile")
-    if isinstance(original_subscription_profile, dict):
-        user_state["original_subscription_profile"] = normalize_json_value(
-            original_subscription_profile
+        temporary_subscription_profile["expire_at"] = format_datetime_value(
+            temporary_active_until
         )
+        user_state["temporary_subscription_profile"] = temporary_subscription_profile
 
     temporary_subscription_profile = raw_state.get("temporary_subscription_profile")
     if isinstance(temporary_subscription_profile, dict):
@@ -993,7 +999,43 @@ def calculate_temporary_traffic_limit_bytes(original_profile, used_traffic_bytes
     else:
         baseline_traffic_bytes = max(0, used_traffic_bytes)
 
-    return baseline_traffic_bytes + TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES
+    desired_limit_bytes = baseline_traffic_bytes + TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES
+    return ceil_traffic_limit_to_gib_bytes(desired_limit_bytes)
+
+
+def ceil_traffic_limit_to_gib_bytes(traffic_limit_bytes):
+    traffic_limit_bytes = parse_int_value(traffic_limit_bytes)
+    if traffic_limit_bytes is None or traffic_limit_bytes <= 0:
+        return None
+
+    return ((traffic_limit_bytes + GIB_BYTES - 1) // GIB_BYTES) * GIB_BYTES
+
+
+def round_traffic_limit_to_remnashop_gb_bytes(traffic_limit_bytes):
+    # Remnashop 0.7.5 syncs Remnawave bytes through integer GB with ROUND_HALF_UP.
+    traffic_limit_bytes = parse_int_value(traffic_limit_bytes)
+    if traffic_limit_bytes is None or traffic_limit_bytes <= 0:
+        return None
+
+    rounded_gb = (traffic_limit_bytes + GIB_BYTES // 2) // GIB_BYTES
+    if rounded_gb <= 0:
+        return None
+
+    return rounded_gb * GIB_BYTES
+
+
+def traffic_limit_matches_temporary(current_traffic_limit_bytes, temporary_traffic_limit_bytes):
+    current_traffic_limit_bytes = parse_int_value(current_traffic_limit_bytes)
+    temporary_traffic_limit_bytes = parse_int_value(temporary_traffic_limit_bytes)
+    if current_traffic_limit_bytes is None or temporary_traffic_limit_bytes is None:
+        return False
+
+    if current_traffic_limit_bytes == temporary_traffic_limit_bytes:
+        return True
+
+    return current_traffic_limit_bytes == round_traffic_limit_to_remnashop_gb_bytes(
+        temporary_traffic_limit_bytes
+    )
 
 
 def build_temporary_subscription_profile(
@@ -1024,8 +1066,10 @@ def build_original_access_restore_settings(user_state, current_profile):
         temporary_profile.get("traffic_limit_bytes")
     )
     if (
-        temporary_traffic_limit_bytes is not None
-        and current_traffic_limit_bytes == temporary_traffic_limit_bytes
+        traffic_limit_matches_temporary(
+            current_traffic_limit_bytes,
+            temporary_traffic_limit_bytes,
+        )
         and "traffic_limit_bytes" in original_profile
     ):
         settings_to_restore["traffic_limit_bytes"] = parse_int_value(
@@ -1069,6 +1113,14 @@ def should_restore_original_squads(user_state, current_profile):
         return True
 
     return current_profile["expire_at"] != format_datetime_value(original_expire_at)
+
+
+def should_restore_after_traffic_reset(user_state):
+    original_status = user_state.get("original_status")
+    if not isinstance(original_status, str):
+        return False
+
+    return original_status.upper() == "LIMITED"
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -1292,6 +1344,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         )
                     )
 
+                    if not save_user_states():
+                        user_state.pop("temporary_active_until", None)
+                        user_state.pop("temporary_subscription_profile", None)
+                        self._send_text(500, "Failed to update local state")
+                        return
+
                     if not patch_user_access(
                         user_uuid,
                         temporary_expire_at,
@@ -1300,16 +1358,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     ):
                         user_state.pop("temporary_active_until", None)
                         user_state.pop("temporary_subscription_profile", None)
+                        save_user_states()
                         self._send_text(502, "Failed to activate user temporarily")
-                        return
-
-                    if not save_user_states():
-                        self._send_text(500, "Failed to update local state")
                         return
 
                     log(
                         f"Temporarily activated {username} until "
-                        f"{user_state['temporary_active_until']}"
+                        f"{user_state['temporary_active_until']}, "
+                        f"traffic_limit_bytes="
+                        f"{temporary_traffic_limit_bytes if temporary_traffic_limit_bytes is not None else 'unchanged'}"
                     )
                 else:
                     log(
@@ -1377,10 +1434,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     self._send_text(200, "Ignored")
                     return
 
-                real_subscription_change_detected = should_restore_original_squads(
-                    user_state,
-                    subscription_profile,
+                traffic_reset_restore_detected = (
+                    event == "user.traffic_reset"
+                    and should_restore_after_traffic_reset(user_state)
                 )
+                real_subscription_change_detected = (
+                    traffic_reset_restore_detected
+                    or should_restore_original_squads(
+                        user_state,
+                        subscription_profile,
+                    )
+                )
+
+                if traffic_reset_restore_detected:
+                    log(
+                        f"Traffic reset detected for limited user {username}; "
+                        "restoring original squads"
+                    )
 
                 if not real_subscription_change_detected:
                     log(
@@ -1459,6 +1529,26 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     and squads_patch is UNSET
                     and external_patch is UNSET
                 ):
+                    if (
+                        restore_access_settings
+                        and not patch_user_traffic_settings(
+                            user_uuid,
+                            traffic_limit_bytes=restore_access_settings.get(
+                                "traffic_limit_bytes"
+                            ),
+                            traffic_limit_strategy=restore_access_settings.get(
+                                "traffic_limit_strategy", ""
+                            ),
+                        )
+                    ):
+                        log(
+                            f"Failed to restore original access settings for {username}: "
+                            f"{preview_json(restore_access_settings)}; "
+                            f"acknowledging webhook to retry on the next user event"
+                        )
+                        self._send_text(200, "Failed to restore user access settings")
+                        return
+
                     user_states.pop(user_uuid, None)
                     if not save_user_states():
                         user_states[user_uuid] = user_state
@@ -1477,7 +1567,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 if already_restored:
                     if (
                         restore_access_settings
-                        and not remnashop_assigned_new_squads
                         and not patch_user_traffic_settings(
                             user_uuid,
                             traffic_limit_bytes=restore_access_settings.get(
@@ -1525,7 +1614,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
                     if (
                         restore_access_settings
-                        and not remnashop_assigned_new_squads
                         and not patch_user_traffic_settings(
                             user_uuid,
                             traffic_limit_bytes=restore_access_settings.get(
