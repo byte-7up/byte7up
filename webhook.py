@@ -162,6 +162,9 @@ SUBSCRIPTION_PROFILE_ALIASES = {
         "maxHwidDevices",
         "max_hwid_devices",
     ),
+    "tag": (
+        "tag",
+    ),
 }
 
 SENSITIVE_LOG_KEYS = {
@@ -543,6 +546,9 @@ def extract_subscription_profile(user):
 
             value = user.get(alias)
             if value is None:
+                if canonical_key == "tag":
+                    profile[canonical_key] = None
+                    break
                 continue
 
             if canonical_key == "expire_at":
@@ -729,6 +735,18 @@ def normalize_user_state(user_uuid, raw_state):
     if isinstance(temporary_subscription_profile, dict):
         user_state["temporary_subscription_profile"] = normalize_json_value(
             temporary_subscription_profile
+        )
+
+    temporary_expire_at_deduction_seconds = parse_int_value(
+        raw_state.get("temporary_expire_at_deduction_seconds")
+        or raw_state.get("temporaryExpireAtDeductionSeconds")
+    )
+    if (
+        temporary_expire_at_deduction_seconds is not None
+        and temporary_expire_at_deduction_seconds > 0
+    ):
+        user_state["temporary_expire_at_deduction_seconds"] = (
+            temporary_expire_at_deduction_seconds
         )
 
     return user_state
@@ -946,9 +964,27 @@ def patch_user_access(user_uuid, expire_at, traffic_limit_bytes=None, traffic_li
     return patch_user(user_uuid, payload_variants)
 
 
-def patch_user_traffic_settings(user_uuid, traffic_limit_bytes=None, traffic_limit_strategy=""):
+def patch_user_access_settings(
+    user_uuid,
+    expire_at=None,
+    traffic_limit_bytes=None,
+    traffic_limit_strategy="",
+):
     primary_payload = {}
     fallback_payload = {}
+
+    if expire_at is not None:
+        parsed_expire_at = (
+            expire_at
+            if isinstance(expire_at, datetime)
+            else parse_datetime_value(expire_at)
+        )
+        if parsed_expire_at is None:
+            return False
+
+        formatted_expire_at = format_datetime_value(parsed_expire_at)
+        primary_payload["expireAt"] = formatted_expire_at
+        fallback_payload["expire_at"] = formatted_expire_at
 
     if traffic_limit_bytes is not None:
         primary_payload["trafficLimitBytes"] = traffic_limit_bytes
@@ -968,14 +1004,37 @@ def patch_user_traffic_settings(user_uuid, traffic_limit_bytes=None, traffic_lim
     return patch_user(user_uuid, payload_variants)
 
 
+def patch_user_traffic_settings(user_uuid, traffic_limit_bytes=None, traffic_limit_strategy=""):
+    return patch_user_access_settings(
+        user_uuid,
+        traffic_limit_bytes=traffic_limit_bytes,
+        traffic_limit_strategy=traffic_limit_strategy,
+    )
+
+
+def patch_user_restore_access_settings(user_uuid, restore_access_settings):
+    if not restore_access_settings:
+        return True
+
+    return patch_user_access_settings(
+        user_uuid,
+        expire_at=restore_access_settings.get("expire_at"),
+        traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
+        traffic_limit_strategy=restore_access_settings.get("traffic_limit_strategy", ""),
+    )
+
+
 def get_temporary_expire_at_offset_seconds(user_uuid):
     # Add a tiny deterministic offset so our temporary expireAt is easy to
     # recognize later and does not rely on webhook timing.
     return zlib.crc32(user_uuid.encode("utf-8")) % 53 + 7
 
 
-def calculate_temporary_expire_at(user_uuid, current_expire_at):
-    minimum_expire_at = datetime.now(timezone.utc) + timedelta(days=TEMP_ACTIVE_DAYS)
+def calculate_temporary_expire_at(user_uuid, current_expire_at, now=None):
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    minimum_expire_at = now + timedelta(days=TEMP_ACTIVE_DAYS)
     if current_expire_at is None:
         base_expire_at = minimum_expire_at
     else:
@@ -984,6 +1043,22 @@ def calculate_temporary_expire_at(user_uuid, current_expire_at):
     return base_expire_at.replace(microsecond=0) + timedelta(
         seconds=get_temporary_expire_at_offset_seconds(user_uuid)
     )
+
+
+def calculate_temporary_expire_at_deduction_seconds(
+    current_expire_at,
+    temporary_expire_at,
+    now,
+):
+    if TEMP_ACTIVE_DAYS <= 0 or temporary_expire_at is None:
+        return 0
+
+    baseline_expire_at = now
+    if current_expire_at is not None and current_expire_at > baseline_expire_at:
+        baseline_expire_at = current_expire_at
+
+    deduction_seconds = int((temporary_expire_at - baseline_expire_at).total_seconds())
+    return max(0, deduction_seconds)
 
 
 def calculate_temporary_traffic_limit_bytes(original_profile, used_traffic_bytes):
@@ -1012,7 +1087,7 @@ def ceil_traffic_limit_to_gib_bytes(traffic_limit_bytes):
 
 
 def round_traffic_limit_to_remnashop_gb_bytes(traffic_limit_bytes):
-    # Remnashop 0.7.5 syncs Remnawave bytes through integer GB with ROUND_HALF_UP.
+    # Remnashop stores traffic limits as integer GB, then converts them to bytes.
     traffic_limit_bytes = parse_int_value(traffic_limit_bytes)
     if traffic_limit_bytes is None or traffic_limit_bytes <= 0:
         return None
@@ -1053,7 +1128,75 @@ def build_temporary_subscription_profile(
     return temporary_profile
 
 
-def build_original_access_restore_settings(user_state, current_profile):
+def subscription_tag_changed(user_state, current_profile):
+    if not current_profile or "tag" not in current_profile:
+        return False
+
+    original_profile = user_state.get("original_subscription_profile") or {}
+    if "tag" not in original_profile:
+        return False
+
+    return current_profile.get("tag") != original_profile.get("tag")
+
+
+def get_temporary_expire_at_deduction_seconds(user_uuid, user_state):
+    deduction_seconds = parse_int_value(
+        user_state.get("temporary_expire_at_deduction_seconds")
+    )
+    if deduction_seconds is not None:
+        return max(0, deduction_seconds)
+
+    original_status = user_state.get("original_status")
+    if isinstance(original_status, str) and original_status.upper() == "EXPIRED":
+        return (
+            TEMP_ACTIVE_DAYS * 24 * 60 * 60
+            + get_temporary_expire_at_offset_seconds(user_uuid)
+        )
+
+    return 0
+
+
+def calculate_expire_at_without_temporary_access(user_uuid, user_state, current_profile):
+    if TEMP_ACTIVE_DAYS <= 0 or not current_profile:
+        return None
+
+    current_expire_at = parse_datetime_value(current_profile.get("expire_at"))
+    temporary_active_until = parse_datetime_value(
+        user_state.get("temporary_active_until")
+    )
+    if current_expire_at is None or temporary_active_until is None:
+        return None
+
+    if current_expire_at <= temporary_active_until:
+        return None
+
+    deduction_seconds = get_temporary_expire_at_deduction_seconds(
+        user_uuid,
+        user_state,
+    )
+    remaining_temporary_seconds = int(
+        (temporary_active_until - datetime.now(timezone.utc)).total_seconds()
+    )
+    deduction_seconds = min(
+        deduction_seconds,
+        max(0, remaining_temporary_seconds),
+    )
+    if deduction_seconds <= 0:
+        return None
+
+    adjusted_expire_at = current_expire_at - timedelta(seconds=deduction_seconds)
+    if adjusted_expire_at >= current_expire_at:
+        return None
+
+    return adjusted_expire_at.replace(microsecond=0)
+
+
+def build_original_access_restore_settings(
+    user_uuid,
+    user_state,
+    current_profile,
+    restore_temporary_traffic=True,
+):
     if not current_profile:
         return {}
 
@@ -1061,31 +1204,48 @@ def build_original_access_restore_settings(user_state, current_profile):
     temporary_profile = user_state.get("temporary_subscription_profile") or {}
     settings_to_restore = {}
 
-    current_traffic_limit_bytes = parse_int_value(current_profile.get("traffic_limit_bytes"))
-    temporary_traffic_limit_bytes = parse_int_value(
-        temporary_profile.get("traffic_limit_bytes")
+    adjusted_expire_at = calculate_expire_at_without_temporary_access(
+        user_uuid,
+        user_state,
+        current_profile,
     )
-    if (
-        traffic_limit_matches_temporary(
+    if adjusted_expire_at is not None:
+        settings_to_restore["expire_at"] = adjusted_expire_at
+
+    if restore_temporary_traffic:
+        current_traffic_limit_bytes = parse_int_value(
+            current_profile.get("traffic_limit_bytes")
+        )
+        temporary_traffic_limit_bytes = parse_int_value(
+            temporary_profile.get("traffic_limit_bytes")
+        )
+        temporary_traffic_limit_matches = traffic_limit_matches_temporary(
             current_traffic_limit_bytes,
             temporary_traffic_limit_bytes,
         )
-        and "traffic_limit_bytes" in original_profile
-    ):
-        settings_to_restore["traffic_limit_bytes"] = parse_int_value(
-            original_profile.get("traffic_limit_bytes")
-        ) or 0
-
-    current_traffic_limit_strategy = current_profile.get("traffic_limit_strategy")
-    temporary_traffic_limit_strategy = temporary_profile.get("traffic_limit_strategy")
-    if (
-        temporary_traffic_limit_strategy
-        and current_traffic_limit_strategy == temporary_traffic_limit_strategy
-        and "traffic_limit_strategy" in original_profile
-    ):
-        settings_to_restore["traffic_limit_strategy"] = (
-            original_profile.get("traffic_limit_strategy") or ""
+        current_traffic_limit_strategy = current_profile.get("traffic_limit_strategy")
+        temporary_traffic_limit_strategy = temporary_profile.get("traffic_limit_strategy")
+        temporary_traffic_strategy_matches = (
+            not temporary_traffic_limit_strategy
+            or current_traffic_limit_strategy == temporary_traffic_limit_strategy
         )
+        temporary_traffic_matches = (
+            temporary_traffic_limit_matches
+            and temporary_traffic_strategy_matches
+        )
+        if temporary_traffic_matches and "traffic_limit_bytes" in original_profile:
+            settings_to_restore["traffic_limit_bytes"] = parse_int_value(
+                original_profile.get("traffic_limit_bytes")
+            ) or 0
+
+        if (
+            temporary_traffic_matches
+            and temporary_traffic_limit_strategy
+            and "traffic_limit_strategy" in original_profile
+        ):
+            settings_to_restore["traffic_limit_strategy"] = (
+                original_profile.get("traffic_limit_strategy") or ""
+            )
 
     return settings_to_restore
 
@@ -1318,13 +1478,26 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     user_state.get("temporary_active_until")
                 )
                 if temporary_active_until is None:
+                    temporary_started_at = datetime.now(timezone.utc)
                     temporary_expire_at = calculate_temporary_expire_at(
                         user_uuid,
                         expire_at,
+                        now=temporary_started_at,
+                    )
+                    temporary_expire_at_deduction_seconds = (
+                        calculate_temporary_expire_at_deduction_seconds(
+                            expire_at,
+                            temporary_expire_at,
+                            temporary_started_at,
+                        )
                     )
                     user_state["temporary_active_until"] = format_datetime_value(
                         temporary_expire_at
                     )
+                    if temporary_expire_at_deduction_seconds > 0:
+                        user_state["temporary_expire_at_deduction_seconds"] = (
+                            temporary_expire_at_deduction_seconds
+                        )
                     original_profile = user_state.get("original_subscription_profile") or {}
                     temporary_traffic_limit_bytes = calculate_temporary_traffic_limit_bytes(
                         original_profile,
@@ -1347,6 +1520,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     if not save_user_states():
                         user_state.pop("temporary_active_until", None)
                         user_state.pop("temporary_subscription_profile", None)
+                        user_state.pop("temporary_expire_at_deduction_seconds", None)
                         self._send_text(500, "Failed to update local state")
                         return
 
@@ -1358,6 +1532,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     ):
                         user_state.pop("temporary_active_until", None)
                         user_state.pop("temporary_subscription_profile", None)
+                        user_state.pop("temporary_expire_at_deduction_seconds", None)
                         save_user_states()
                         self._send_text(502, "Failed to activate user temporarily")
                         return
@@ -1459,10 +1634,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     )
                     self._send_text(200, "Ignored")
                     return
-                restore_access_settings = build_original_access_restore_settings(
-                    user_state,
-                    subscription_profile,
-                )
                 internal_backup_managed = bool(target_squads)
                 external_backup_managed = target_external_squad is not UNSET
                 internal_squads_are_original = (
@@ -1503,6 +1674,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     internal_squads_are_remnashop_assigned
                     or external_squad_is_remnashop_assigned
                 )
+                remnashop_assigned_new_subscription = (
+                    remnashop_assigned_new_squads
+                    or subscription_tag_changed(user_state, subscription_profile)
+                )
+                restore_access_settings = build_original_access_restore_settings(
+                    user_uuid,
+                    user_state,
+                    subscription_profile,
+                    restore_temporary_traffic=not remnashop_assigned_new_subscription,
+                )
                 squads_patch = (
                     squads_to_restore
                     if (
@@ -1531,14 +1712,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 ):
                     if (
                         restore_access_settings
-                        and not patch_user_traffic_settings(
+                        and not patch_user_restore_access_settings(
                             user_uuid,
-                            traffic_limit_bytes=restore_access_settings.get(
-                                "traffic_limit_bytes"
-                            ),
-                            traffic_limit_strategy=restore_access_settings.get(
-                                "traffic_limit_strategy", ""
-                            ),
+                            restore_access_settings,
                         )
                     ):
                         log(
@@ -1567,14 +1743,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 if already_restored:
                     if (
                         restore_access_settings
-                        and not patch_user_traffic_settings(
+                        and not patch_user_restore_access_settings(
                             user_uuid,
-                            traffic_limit_bytes=restore_access_settings.get(
-                                "traffic_limit_bytes"
-                            ),
-                            traffic_limit_strategy=restore_access_settings.get(
-                                "traffic_limit_strategy", ""
-                            ),
+                            restore_access_settings,
                         )
                     ):
                         log(
@@ -1614,14 +1785,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
                     if (
                         restore_access_settings
-                        and not patch_user_traffic_settings(
+                        and not patch_user_restore_access_settings(
                             user_uuid,
-                            traffic_limit_bytes=restore_access_settings.get(
-                                "traffic_limit_bytes"
-                            ),
-                            traffic_limit_strategy=restore_access_settings.get(
-                                "traffic_limit_strategy", ""
-                            ),
+                            restore_access_settings,
                         )
                     ):
                         log(

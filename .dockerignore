@@ -1,5 +1,8 @@
 .git
 .github
+.agents
+.tmp-webhook-check
+_research
 .env
 .env.*
 data
